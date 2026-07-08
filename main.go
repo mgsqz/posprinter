@@ -1,6 +1,7 @@
 package main
  
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -24,28 +25,24 @@ import (
  
 // Config 定义配置文件结构
 type Config struct {
-	LatestFile  string `json:"latest_file"`
-	BackupDir   string `json:"backup_dir"`
-	ListenPort  int    `json:"listen_port"`
-	WebPort     int    `json:"web_port"`
-	MinDataSize int    `json:"min_data_size"`
+	LatestFile string `json:"latest_file"`
+	BackupDir  string `json:"backup_dir"`
+	ListenPort int    `json:"listen_port"`
+	WebPort    int    `json:"web_port"`
 }
  
 var appConfig = Config{
-	LatestFile:  "latest.prn",
-	BackupDir:   "./backups",
-	ListenPort:  9100,
-	WebPort:     8080,
-	MinDataSize: 10,
+	LatestFile: "latest.prn",
+	BackupDir:  "./backups",
+	ListenPort: 9100,
+	WebPort:    8080,
 }
- 
-const bufferSize = 64 * 1024
  
 // === SSE 广播器实现 ===
 type Broker struct {
 	clients     map[chan string]bool
 	mutex       sync.Mutex
-	lastMessage string // 新增：缓存最后一次消息，供新连接的客户端立即获取
+	lastMessage string // 缓存最后一次消息，供新连接的客户端立即获取
 }
  
 var broker = NewBroker()
@@ -58,7 +55,6 @@ func (b *Broker) AddClient() chan string {
 	ch := make(chan string, 10)
 	b.mutex.Lock()
 	b.clients[ch] = true
-	// 如果有缓存消息，立即发送给新客户端
 	if b.lastMessage != "" {
 		ch <- b.lastMessage
 	}
@@ -75,7 +71,7 @@ func (b *Broker) RemoveClient(ch chan string) {
  
 func (b *Broker) Broadcast(msg string) {
 	b.mutex.Lock()
-	b.lastMessage = msg // 缓存最新消息
+	b.lastMessage = msg
 	for ch := range b.clients {
 		select {
 		case ch <- msg:
@@ -203,41 +199,118 @@ func loadConfig(configPath string) {
 	if appConfig.BackupDir == "" { appConfig.BackupDir = "./backups" }
 	if appConfig.ListenPort == 0 { appConfig.ListenPort = 9100 }
 	if appConfig.WebPort == 0 { appConfig.WebPort = 8080 }
-	if appConfig.MinDataSize <= 0 { appConfig.MinDataSize = 10 }
 }
  
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	clientAddr := conn.RemoteAddr().String()
  
-	initialBuf := make([]byte, appConfig.MinDataSize)
-	n, err := io.ReadFull(conn, initialBuf)
-	if n < appConfig.MinDataSize {
-		log.Printf("丢弃无效连接: 来自 %s (仅 %d 字节)", clientAddr, n)
-		return
-	}
+	// 设置 15 秒读取超时，防止僵尸连接阻塞
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
  
-	log.Printf("收到来自 %s 的打印数据，验证通过...", clientAddr)
+	log.Printf("收到来自 %s 的连接，开始监听流...", clientAddr)
  
 	latestFile, err := os.Create(appConfig.LatestFile)
-	if err != nil { return }
+	if err != nil { log.Printf("创建主文件失败: %v", err); return }
 	defer latestFile.Close()
  
 	timestamp := time.Now().Format("20060102_150405")
 	backupFile, err := os.Create(filepath.Join(appConfig.BackupDir, fmt.Sprintf("%s.raw", timestamp)))
-	if err != nil { return }
+	if err != nil { log.Printf("创建备份文件失败: %v", err); return }
 	defer backupFile.Close()
  
 	var dataBuf bytes.Buffer
 	writer := io.MultiWriter(latestFile, backupFile, &dataBuf)
-	writer.Write(initialBuf)
+	reader := bufio.NewReader(conn)
  
-	remainingBytes, err := io.CopyBuffer(writer, conn, make([]byte, bufferSize))
-	if err != nil {
-		log.Printf("数据传输异常 (来自 %s): %v", clientAddr, err)
+	totalBytes := 0
+	hasValidData := false
+ 
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if err == io.EOF { break }
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("连接超时: 来自 %s (共 %d 字节)", clientAddr, totalBytes)
+				break
+			}
+			break
+		}
+ 
+		// === 核心：实时状态指令拦截与回复 ===
+		if b == 0x10 { // DLE
+			b2, err := reader.ReadByte()
+			if err == nil {
+				if b2 == 0x04 { // DLE EOT n (状态请求)
+					b3, err := reader.ReadByte()
+					if err == nil {
+						hasValidData = true
+						var resp byte
+						switch b3 {
+						case 1: resp = 0x16 // 打印机正常
+						case 2: resp = 0x12 // 脱机状态正常
+						case 3: resp = 0x00 // 错误状态无错
+						case 4: resp = 0x12 // 纸张传感器正常
+						}
+						conn.Write([]byte{resp})
+						continue // 不写入文件，直接过滤
+					}
+				}
+				writer.Write([]byte{b, b2})
+				totalBytes += 2
+				hasValidData = true
+				continue
+			}
+		} else if b == 0x1d { // GS
+			b2, err := reader.ReadByte()
+			if err == nil {
+				if b2 == 0x72 { // GS r n (状态请求)
+					b3, err := reader.ReadByte()
+					if err == nil {
+						hasValidData = true
+						if b3 == 1 || b3 == 2 || b3 == 4 {
+							conn.Write([]byte{0x00}) // 回复正常
+							continue
+						}
+					}
+				}
+				writer.Write([]byte{b, b2})
+				totalBytes += 2
+				hasValidData = true
+				continue
+			}
+		} else if b == 0x1b { // ESC
+			b2, err := reader.ReadByte()
+			if err == nil {
+				if b2 == 0x76 { // ESC v (状态请求)
+					hasValidData = true
+					conn.Write([]byte{0x00})
+					continue
+				} else if b2 == 0x75 { // ESC u n
+					reader.ReadByte()
+					hasValidData = true
+					conn.Write([]byte{0x00})
+					continue
+				}
+				writer.Write([]byte{b, b2})
+				totalBytes += 2
+				hasValidData = true
+				continue
+			}
+		}
+ 
+		// 正常数据写入
+		writer.Write([]byte{b})
+		totalBytes++
+		if b != 0x00 { hasValidData = true }
 	}
  
-	totalBytes := int64(n) + remainingBytes
+	if !hasValidData || totalBytes < 3 {
+		log.Printf("丢弃无效连接: 来自 %s (仅 %d 字节)", clientAddr, totalBytes)
+		return
+	}
+ 
 	log.Printf("来自 %s 接收完成，共 %d 字节", clientAddr, totalBytes)
  
 	htmlStr := escToHTML(dataBuf.Bytes())
@@ -265,7 +338,6 @@ func (p *parserState) getStyle() string {
 	
 	if p.justification == 1 { style += "text-align:center;" } else if p.justification == 2 { style += "text-align:right;" } else { style += "text-align:left;" }
 	
-	// 核心修复：字体大小取宽度和高度的最大值，行距跟随高度倍数
 	scale := 1
 	if p.widthMultiple > p.heightMultiple {
 		scale = p.widthMultiple
@@ -286,7 +358,6 @@ func (p *parserState) flushLine() {
 }
  
 func escToHTML(raw []byte) string {
-	// 自动检测编码，如果是 UTF-8 则直接使用
 	var utf8Data []byte
 	if utf8.Valid(raw) {
 		utf8Data = raw
@@ -309,49 +380,48 @@ func escToHTML(raw []byte) string {
 	for i < len(utf8Data) {
 		b := utf8Data[i]
  
-		if b == 27 { // ESC (0x1b)
+		if b == 27 { // ESC
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				switch cmd {
-				case 64: // ESC @ 初始化
+				case 64:
 					p.bold = false; p.underline = false; p.widthMultiple = 1; p.heightMultiple = 1; p.justification = 0
 					i += 2; continue
-				case 97: // ESC a n 对齐
+				case 97:
 					if i+2 < len(utf8Data) { p.justification = int(utf8Data[i+2]); i += 3; continue }
-				case 69: // ESC E n 加粗
+				case 69:
 					if i+2 < len(utf8Data) { p.bold = utf8Data[i+2] == 1; i += 3; continue }
-				case 45: // ESC - n 下划线
+				case 45:
 					if i+2 < len(utf8Data) { p.underline = utf8Data[i+2] == 1; i += 3; continue }
-				case 33: // ESC ! n 英文字体模式
+				case 33:
 					if i+2 < len(utf8Data) {
 						n := utf8Data[i+2]
 						p.bold = (n & 8) != 0
 						p.underline = (n & 128) != 0
-						// 适配常见的 ESC ! 放大逻辑
 						p.heightMultiple = 1
 						if (n & 16) != 0 { p.heightMultiple = 2 }
 						p.widthMultiple = 1
 						if (n & 32) != 0 { p.widthMultiple = 2 }
 						i += 3; continue
 					}
-				case 100: // ESC d n 走纸n行
+				case 100:
 					p.flushLine()
 					if i+2 < len(utf8Data) {
 						for j := 0; j < int(utf8Data[i+2]); j++ { p.sb.WriteString("<br>") }
 						i += 3; continue
 					}
-				case 50: // ESC 2
+				case 50:
 					i += 2; continue
-				case 51, 74, 77, 82, 85, 86, 99, 103, 123, 32: // ESC 3 n 等带1参数
+				case 51, 74, 77, 82, 85, 86, 99, 103, 123, 32:
 					if i+2 < len(utf8Data) { i += 3; continue }
 				}
-				i += 2; continue // 未知ESC安全跳过2字节
+				i += 2; continue
 			}
 			i++; continue
-		} else if b == 29 { // GS (0x1d)
+		} else if b == 29 { // GS
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
-				if cmd == 40 && i+4 < len(utf8Data) && utf8Data[i+2] == 107 { // GS ( k (QR码)
+				if cmd == 40 && i+4 < len(utf8Data) && utf8Data[i+2] == 107 {
 					pL := int(utf8Data[i+3])
 					pH := int(utf8Data[i+4])
 					lenPayload := pH*256 + pL
@@ -360,12 +430,12 @@ func escToHTML(raw []byte) string {
 					if end <= len(utf8Data) {
 						cn := utf8Data[start]
 						fn := utf8Data[start+1]
-						if cn == 49 { // QR Code
+						if cn == 49 {
 							payload := utf8Data[start+2 : end]
 							switch fn {
-							case 80: // 存储数据
+							case 80:
 								if len(payload) > 0 { p.qrData = append(p.qrData, payload[1:]...) }
-							case 81: // 打印QR码
+							case 81:
 								if len(p.qrData) > 0 {
 									png, err := qrcode.Encode(string(p.qrData), qrcode.Medium, 256)
 									if err == nil {
@@ -380,61 +450,60 @@ func escToHTML(raw []byte) string {
 					}
 				} else {
 					switch cmd {
-					case 33: // GS ! n 字体大小
+					case 33:
 						if i+2 < len(utf8Data) {
 							n := utf8Data[i+2]
 							p.widthMultiple = int((n>>4)&0x0F) + 1
 							p.heightMultiple = int(n&0x0F) + 1
 							i += 3; continue
 						}
-					case 86: // GS V 切纸
+					case 86:
 						p.flushLine()
 						p.sb.WriteString(`<hr style="border-top: 1px dashed #000; margin: 10px 0;">`)
 						if i+2 < len(utf8Data) { i += 3; continue }
 						i += 2; continue
-					case 72, 81, 102, 104, 119, 66: // GS H n 等带1参数
+					case 72, 81, 102, 104, 119, 66:
 						if i+2 < len(utf8Data) { i += 3; continue }
-					case 76, 87: // GS L nL nH 带2参数
+					case 76, 87:
 						if i+3 < len(utf8Data) { i += 4; continue }
-					case 50: // GS 2
+					case 50:
 						i += 2; continue
 					}
 					i += 2; continue
 				}
 			}
 			i++; continue
-		} else if b == 28 { // FS (0x1c) 指令 (汉字处理)
+		} else if b == 28 { // FS
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				switch cmd {
-				case 33: // FS ! n 汉字字体模式
+				case 33:
 					if i+2 < len(utf8Data) {
 						n := utf8Data[i+2]
 						p.bold = (n & 16) != 0
 						p.underline = (n & 32) != 0
-						// 适配常见的 FS ! 放大逻辑
 						p.heightMultiple = 1
 						if (n & 8) != 0 { p.heightMultiple = 2 }
 						p.widthMultiple = 1
 						if (n & 1) != 0 { p.widthMultiple = 2 }
 						i += 3; continue
 					}
-				case 38, 46: // FS & , FS .
+				case 38, 46:
 					i += 2; continue
-				case 83: // FS S n1 n2
+				case 83:
 					if i+3 < len(utf8Data) { i += 4; continue }
-				case 67, 73, 74, 99, 110, 45: // FS C n 等
+				case 67, 73, 74, 99, 110, 45:
 					if i+2 < len(utf8Data) { i += 3; continue }
 				}
 				i += 2; continue
 			}
 			i++; continue
-		} else if b == 10 { // LF 换行
+		} else if b == 10 {
 			p.flushLine()
 			i++; continue
-		} else if b == 13 { // CR 回车
+		} else if b == 13 {
 			i++; continue
-		} else if b < 32 { // 其他控制字符丢弃
+		} else if b < 32 {
 			i++; continue
 		} else {
 			p.line.WriteByte(b)
