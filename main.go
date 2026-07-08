@@ -100,7 +100,6 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
         <div id="receipt"></div>
     </div>
     <script>
-        // 客户端每秒主动刷新请求最新数据
         async function fetchReceipt() {
             try {
                 const response = await fetch('/data?ts=' + new Date().getTime());
@@ -121,7 +120,6 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 }
  
 func dataHandler(w http.ResponseWriter, r *http.Request) {
-	// 每次请求时，直接从磁盘读取 latest.prn 并解析返回
 	rawData, err := os.ReadFile(appConfig.LatestFile)
 	if err != nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -265,10 +263,11 @@ func handleConnection(conn net.Conn) {
 	backupFile.Write(dataBuf.Bytes())
 }
  
-// === ESC/POS 状态解析器 ===
+// === ESC/POS 状态解析器 (支持行内样式独立渲染) ===
 type parserState struct {
-	sb   strings.Builder
-	line strings.Builder
+	sb      strings.Builder
+	lineBuf strings.Builder // 存放当前行的 HTML 片段
+	textBuf strings.Builder // 存放当前未闭合的纯文本
  
 	bold          bool
 	underline     bool
@@ -279,30 +278,45 @@ type parserState struct {
 	qrData []byte
 }
  
-func (p *parserState) getStyle() string {
-	style := ""
-	if p.bold { style += "font-weight:bold;" }
-	if p.underline { style += "text-decoration:underline;" }
-	
-	if p.justification == 1 { style += "text-align:center;" } else if p.justification == 2 { style += "text-align:right;" } else { style += "text-align:left;" }
-	
-	scale := 1
-	if p.widthMultiple > p.heightMultiple {
-		scale = p.widthMultiple
-	} else {
-		scale = p.heightMultiple
+func (p *parserState) flushText() {
+	if p.textBuf.Len() > 0 {
+		text := html.EscapeString(p.textBuf.String())
+		text = strings.ReplaceAll(text, " ", "&nbsp;")
+		
+		style := ""
+		if p.bold { style += "font-weight:bold;" }
+		if p.underline { style += "text-decoration:underline;" }
+		
+		scale := 1
+		if p.widthMultiple > p.heightMultiple {
+			scale = p.widthMultiple
+		} else {
+			scale = p.heightMultiple
+		}
+		if scale > 1 {
+			style += fmt.Sprintf("font-size:%dpx; line-height:%d%%;", 14 * scale, 120 * p.heightMultiple)
+		}
+		
+		if style != "" {
+			p.lineBuf.WriteString(`<span style="` + style + `">` + text + `</span>`)
+		} else {
+			p.lineBuf.WriteString(text)
+		}
+		p.textBuf.Reset()
 	}
-	if scale > 1 {
-		style += fmt.Sprintf("font-size:%dpx; line-height:%d%%;", 14 * scale, 120 * p.heightMultiple)
-	}
-	return style
 }
  
 func (p *parserState) flushLine() {
-	text := html.EscapeString(p.line.String())
-	text = strings.ReplaceAll(text, " ", "&nbsp;")
-	p.sb.WriteString(`<div style="` + p.getStyle() + `">` + text + `</div>`)
-	p.line.Reset()
+	p.flushText()
+	align := "left"
+	if p.justification == 1 { align = "center" } else if p.justification == 2 { align = "right" }
+	
+	if p.lineBuf.Len() == 0 {
+		p.sb.WriteString(`<div style="text-align:` + align + `;">&nbsp;</div>`)
+	} else {
+		p.sb.WriteString(`<div style="text-align:` + align + `;">` + p.lineBuf.String() + `</div>`)
+	}
+	p.lineBuf.Reset()
 }
  
 func escToHTML(raw []byte) string {
@@ -329,6 +343,7 @@ func escToHTML(raw []byte) string {
 		b := utf8Data[i]
  
 		if b == 27 { // ESC
+			p.flushText() // 遇到指令，先将之前的文本应用当前样式并输出
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				switch cmd {
@@ -367,6 +382,7 @@ func escToHTML(raw []byte) string {
 			}
 			i++; continue
 		} else if b == 29 { // GS
+			p.flushText()
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				if cmd == 40 && i+4 < len(utf8Data) && utf8Data[i+2] == 107 {
@@ -388,7 +404,7 @@ func escToHTML(raw []byte) string {
 									png, err := qrcode.Encode(string(p.qrData), qrcode.Medium, 256)
 									if err == nil {
 										b64 := base64.StdEncoding.EncodeToString(png)
-										p.line.WriteString(fmt.Sprintf(`<img src="data:image/png;base64,%s" style="max-width:200px;"/>`, b64))
+										p.lineBuf.WriteString(fmt.Sprintf(`<img src="data:image/png;base64,%s" style="max-width:200px;"/>`, b64))
 									}
 									p.qrData = []byte{}
 								}
@@ -422,6 +438,7 @@ func escToHTML(raw []byte) string {
 			}
 			i++; continue
 		} else if b == 28 { // FS
+			p.flushText()
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				switch cmd {
@@ -454,7 +471,7 @@ func escToHTML(raw []byte) string {
 		} else if b < 32 {
 			i++; continue
 		} else {
-			p.line.WriteByte(b)
+			p.textBuf.WriteByte(b)
 			i++; continue
 		}
 	}
