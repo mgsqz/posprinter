@@ -270,7 +270,7 @@ func handleConnection(conn net.Conn) {
 	backupFile.Write(dataBuf.Bytes())
 }
  
-// === ESC/POS 状态解析器 (完美解决行高堆叠重叠) ===
+// === ESC/POS 状态解析器 ===
 type parserState struct {
 	sb      strings.Builder
 	lineBuf strings.Builder
@@ -297,7 +297,6 @@ func (p *parserState) flushText() {
 		if p.widthMultiple > 1 || p.heightMultiple > 1 {
 			style += "display: inline-block; vertical-align: top;"
 			if p.heightMultiple > 1 {
-				// 核心修复：以顶部为原点向下拉伸，并用 margin-bottom 撑开文档流高度，彻底消除上下行重叠
 				marginVal := p.heightMultiple - 1
 				style += fmt.Sprintf("transform: scaleY(%d); transform-origin: top left; margin-bottom: %dem;", p.heightMultiple, marginVal)
 			}
@@ -318,7 +317,6 @@ func (p *parserState) flushLine() {
 	align := "left"
 	if p.justification == 1 { align = "center" } else if p.justification == 2 { align = "right" }
 	
-	// 移除强制 line-height，完全依赖 span 的 margin-bottom 自然撑开高度
 	divStyle := "white-space: pre-wrap; text-align:" + align + ";"
 	
 	if p.lineBuf.Len() == 0 {
@@ -356,16 +354,16 @@ func escToHTML(raw []byte) string {
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				switch cmd {
-				case 64:
+				case 64: // ESC @ 初始化
 					p.bold = false; p.underline = false; p.widthMultiple = 1; p.heightMultiple = 1; p.justification = 0
 					i += 2; continue
-				case 97:
+				case 97: // ESC a n
 					if i+2 < len(utf8Data) { p.justification = int(utf8Data[i+2]); i += 3; continue }
-				case 69:
-					if i+2 < len(utf8Data) { p.bold = utf8Data[i+2] == 1; i += 3; continue }
-				case 45:
+				case 69: // ESC E n
+					if i+2 < len(utf8Data) { p.bold = (utf8Data[i+2] & 1) != 0; i += 3; continue }
+				case 45: // ESC - n
 					if i+2 < len(utf8Data) { p.underline = utf8Data[i+2] == 1; i += 3; continue }
-				case 33:
+				case 33: // ESC ! n
 					if i+2 < len(utf8Data) {
 						n := utf8Data[i+2]
 						p.bold = (n & 8) != 0
@@ -376,15 +374,18 @@ func escToHTML(raw []byte) string {
 						if (n & 32) != 0 { p.widthMultiple = 2 }
 						i += 3; continue
 					}
-				case 100:
+				case 112: // ESC p m t1 t2 (钱箱开启脉冲，3个参数)
+					if i+4 < len(utf8Data) { i += 5; continue }
+					i += 2; continue
+				case 100: // ESC d n
 					p.flushLine()
 					if i+2 < len(utf8Data) {
 						for j := 0; j < int(utf8Data[i+2]); j++ { p.sb.WriteString("<br>") }
 						i += 3; continue
 					}
-				case 50:
+				case 50: // ESC 2
 					i += 2; continue
-				case 51, 74, 77, 82, 85, 86, 99, 103, 123, 32:
+				case 51, 74, 77, 82, 85, 86, 99, 103, 123, 32: // ESC 3 n 等带1参数
 					if i+2 < len(utf8Data) { i += 3; continue }
 				}
 				i += 2; continue
@@ -394,7 +395,7 @@ func escToHTML(raw []byte) string {
 			p.flushText()
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
-				if cmd == 40 && i+4 < len(utf8Data) && utf8Data[i+2] == 107 {
+				if cmd == 40 && i+4 < len(utf8Data) && utf8Data[i+2] == 107 { // GS ( k (QR码)
 					pL := int(utf8Data[i+3])
 					pH := int(utf8Data[i+4])
 					lenPayload := pH*256 + pL
@@ -423,23 +424,36 @@ func escToHTML(raw []byte) string {
 					}
 				} else {
 					switch cmd {
-					case 33:
+					case 33: // GS ! n 字体大小
 						if i+2 < len(utf8Data) {
 							n := utf8Data[i+2]
-							p.widthMultiple = int((n>>4)&0x0F) + 1
-							p.heightMultiple = int(n&0x0F) + 1
+							// 兼容部分打印机驱动用 0x20 表示重置的非标准行为
+							if n == 0x20 || n == 0x00 {
+								p.widthMultiple = 1
+								p.heightMultiple = 1
+							} else {
+								p.widthMultiple = int((n>>4)&0x0F) + 1
+								p.heightMultiple = int(n&0x0F) + 1
+							}
 							i += 3; continue
 						}
-					case 86:
+					case 86: // GS V 切纸
 						p.flushLine()
 						p.sb.WriteString(`<hr style="border-top: 1px dashed #000; margin: 10px 0;">`)
-						if i+2 < len(utf8Data) { i += 3; continue }
+						if i+2 < len(utf8Data) {
+							m := utf8Data[i+2]
+							// 兼容某些打印机发出的多余参数字节
+							if (m == 0 || m == 1 || m == 48 || m == 49) && i+3 < len(utf8Data) {
+								i += 4; continue
+							}
+							i += 3; continue
+						}
 						i += 2; continue
-					case 72, 81, 102, 104, 119, 66:
+					case 72, 81, 102, 104, 119, 66: // GS H n 等带1参数
 						if i+2 < len(utf8Data) { i += 3; continue }
-					case 76, 87:
+					case 76, 87: // GS L nL nH 带2参数
 						if i+3 < len(utf8Data) { i += 4; continue }
-					case 50:
+					case 50: // GS 2
 						i += 2; continue
 					}
 					i += 2; continue
@@ -451,7 +465,7 @@ func escToHTML(raw []byte) string {
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				switch cmd {
-				case 33:
+				case 33: // FS ! n 汉字字体模式
 					if i+2 < len(utf8Data) {
 						n := utf8Data[i+2]
 						p.bold = (n & 16) != 0
@@ -462,11 +476,11 @@ func escToHTML(raw []byte) string {
 						if (n & 1) != 0 { p.widthMultiple = 2 }
 						i += 3; continue
 					}
-				case 38, 46:
+				case 38, 46: // FS & , FS .
 					i += 2; continue
-				case 83:
+				case 83: // FS S n1 n2
 					if i+3 < len(utf8Data) { i += 4; continue }
-				case 67, 73, 74, 99, 110, 45:
+				case 67, 73, 74, 99, 110, 45: // FS C n 等
 					if i+2 < len(utf8Data) { i += 3; continue }
 				}
 				i += 2; continue
