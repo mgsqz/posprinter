@@ -230,11 +230,8 @@ func handleConnection(conn net.Conn) {
 						conn.Write([]byte{0x00})
 						continue
 					}
-				} else if b2 == 0x70 { // ESC p m t1 t2 (钱箱开启脉冲，3个参数)
-					// 直接在TCP层吞掉这个硬件指令，防止污染打印数据
-					reader.Read(make([]byte, 3))
-					continue
 				}
+				// 注意：这里不再在TCP层吞掉 ESC p 指令，直接原样存入文件，由解析器安全跳过
 				dataBuf.WriteByte(b)
 				dataBuf.WriteByte(b2)
 				totalBytes += 2
@@ -322,7 +319,11 @@ func (p *parserState) flushText() {
 			}
 			p.lineBuf.WriteString(`<span style="` + style + `">` + text + `</span>`)
 		} else {
-			p.lineBuf.WriteString(text)
+			if style != "" {
+				p.lineBuf.WriteString(`<span style="` + style + `">` + text + `</span>`)
+			} else {
+				p.lineBuf.WriteString(text)
+			}
 		}
 		p.textBuf = p.textBuf[:0]
 	}
@@ -384,6 +385,10 @@ func escToHTML(raw []byte) string {
 						if (n & 32) != 0 { p.widthMultiple = 2 }
 						i += 3; continue
 					}
+				case 112: // ESC p m t1 t2 (钱箱开启脉冲，3个参数)
+					// 核心修复：在这里精确跳过5个字节，防止参数污染文本流
+					if i+4 < len(raw) { i += 5; continue }
+					i += 2; continue
 				case 100: // ESC d n
 					p.flushLine()
 					if i+2 < len(raw) {
