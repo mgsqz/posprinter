@@ -23,10 +23,6 @@ jobs:
           mkdir -p output
           GOOS=linux GOARCH=amd64 go build -o output/escpos_server_linux_amd64 main.go
 
-      - name: 编译 Windows 版本
-        run: |
-          GOOS=windows GOARCH=amd64 go build -o output/escpos_server_windows_amd64.exe main.go
-
       - name: 上传编译产物
         uses: actions/upload-artifact@v4
         with:
