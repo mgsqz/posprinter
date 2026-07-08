@@ -42,7 +42,7 @@ var appConfig = Config{
 type Broker struct {
 	clients     map[chan string]bool
 	mutex       sync.Mutex
-	lastMessage string // 缓存最后一次消息，供新连接的客户端立即获取
+	lastMessage string
 }
  
 var broker = NewBroker()
@@ -205,11 +205,104 @@ func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	clientAddr := conn.RemoteAddr().String()
  
-	// 设置 15 秒读取超时，防止僵尸连接阻塞
 	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
  
 	log.Printf("收到来自 %s 的连接，开始监听流...", clientAddr)
+ 
+	// 核心：先缓存到内存，延迟写盘
+	var dataBuf bytes.Buffer
+	reader := bufio.NewReader(conn)
+	totalBytes := 0
+ 
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			break
+		}
+ 
+		// === 实时状态指令拦截与回复 ===
+		if b == 0x10 { // DLE
+			b2, err := reader.ReadByte()
+			if err == nil {
+				if b2 == 0x04 { // DLE EOT n
+					b3, err := reader.ReadByte()
+					if err == nil {
+						var resp byte
+						switch b3 {
+						case 1: resp = 0x16
+						case 2: resp = 0x12
+						case 3: resp = 0x00
+						case 4: resp = 0x12
+						}
+						conn.Write([]byte{resp})
+						continue
+					}
+				}
+				dataBuf.WriteByte(b)
+				dataBuf.WriteByte(b2)
+				totalBytes += 2
+				continue
+			}
+		} else if b == 0x1d { // GS
+			b2, err := reader.ReadByte()
+			if err == nil {
+				if b2 == 0x72 { // GS r n
+					b3, err := reader.ReadByte()
+					if err == nil {
+						if b3 == 1 || b3 == 2 || b3 == 4 {
+							conn.Write([]byte{0x00})
+							continue
+						}
+						dataBuf.WriteByte(b)
+						dataBuf.WriteByte(b2)
+						dataBuf.WriteByte(b3)
+						totalBytes += 3
+						continue
+					}
+				}
+				dataBuf.WriteByte(b)
+				dataBuf.WriteByte(b2)
+				totalBytes += 2
+				continue
+			}
+		} else if b == 0x1b { // ESC
+			b2, err := reader.ReadByte()
+			if err == nil {
+				if b2 == 0x76 { // ESC v
+					conn.Write([]byte{0x00})
+					continue
+				} else if b2 == 0x75 { // ESC u n
+					if _, err := reader.ReadByte(); err == nil {
+						conn.Write([]byte{0x00})
+						continue
+					}
+				}
+				dataBuf.WriteByte(b)
+				dataBuf.WriteByte(b2)
+				totalBytes += 2
+				continue
+			}
+		}
+ 
+		dataBuf.WriteByte(b)
+		totalBytes++
+	}
+ 
+	// 判断是否为有效的打印数据
+	isValidPrint := false
+	if totalBytes >= 10 && bytes.Contains(dataBuf.Bytes(), []byte{0x0A}) {
+		isValidPrint = true
+	} else if totalBytes >= 50 {
+		isValidPrint = true
+	}
+ 
+	if !isValidPrint {
+		log.Printf("丢弃探测/无效数据: 来自 %s (仅 %d 字节)", clientAddr, totalBytes)
+		return
+	}
+ 
+	log.Printf("来自 %s 接收完成，共 %d 字节，正在写入文件...", clientAddr, totalBytes)
  
 	latestFile, err := os.Create(appConfig.LatestFile)
 	if err != nil { log.Printf("创建主文件失败: %v", err); return }
@@ -220,98 +313,8 @@ func handleConnection(conn net.Conn) {
 	if err != nil { log.Printf("创建备份文件失败: %v", err); return }
 	defer backupFile.Close()
  
-	var dataBuf bytes.Buffer
-	writer := io.MultiWriter(latestFile, backupFile, &dataBuf)
-	reader := bufio.NewReader(conn)
- 
-	totalBytes := 0
-	hasValidData := false
- 
-	for {
-		b, err := reader.ReadByte()
-		if err != nil {
-			if err == io.EOF { break }
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("连接超时: 来自 %s (共 %d 字节)", clientAddr, totalBytes)
-				break
-			}
-			break
-		}
- 
-		// === 核心：实时状态指令拦截与回复 ===
-		if b == 0x10 { // DLE
-			b2, err := reader.ReadByte()
-			if err == nil {
-				if b2 == 0x04 { // DLE EOT n (状态请求)
-					b3, err := reader.ReadByte()
-					if err == nil {
-						hasValidData = true
-						var resp byte
-						switch b3 {
-						case 1: resp = 0x16 // 打印机正常
-						case 2: resp = 0x12 // 脱机状态正常
-						case 3: resp = 0x00 // 错误状态无错
-						case 4: resp = 0x12 // 纸张传感器正常
-						}
-						conn.Write([]byte{resp})
-						continue // 不写入文件，直接过滤
-					}
-				}
-				writer.Write([]byte{b, b2})
-				totalBytes += 2
-				hasValidData = true
-				continue
-			}
-		} else if b == 0x1d { // GS
-			b2, err := reader.ReadByte()
-			if err == nil {
-				if b2 == 0x72 { // GS r n (状态请求)
-					b3, err := reader.ReadByte()
-					if err == nil {
-						hasValidData = true
-						if b3 == 1 || b3 == 2 || b3 == 4 {
-							conn.Write([]byte{0x00}) // 回复正常
-							continue
-						}
-					}
-				}
-				writer.Write([]byte{b, b2})
-				totalBytes += 2
-				hasValidData = true
-				continue
-			}
-		} else if b == 0x1b { // ESC
-			b2, err := reader.ReadByte()
-			if err == nil {
-				if b2 == 0x76 { // ESC v (状态请求)
-					hasValidData = true
-					conn.Write([]byte{0x00})
-					continue
-				} else if b2 == 0x75 { // ESC u n
-					reader.ReadByte()
-					hasValidData = true
-					conn.Write([]byte{0x00})
-					continue
-				}
-				writer.Write([]byte{b, b2})
-				totalBytes += 2
-				hasValidData = true
-				continue
-			}
-		}
- 
-		// 正常数据写入
-		writer.Write([]byte{b})
-		totalBytes++
-		if b != 0x00 { hasValidData = true }
-	}
- 
-	if !hasValidData || totalBytes < 3 {
-		log.Printf("丢弃无效连接: 来自 %s (仅 %d 字节)", clientAddr, totalBytes)
-		return
-	}
- 
-	log.Printf("来自 %s 接收完成，共 %d 字节", clientAddr, totalBytes)
+	latestFile.Write(dataBuf.Bytes())
+	backupFile.Write(dataBuf.Bytes())
  
 	htmlStr := escToHTML(dataBuf.Bytes())
 	broker.Broadcast(htmlStr)
@@ -326,7 +329,7 @@ type parserState struct {
 	underline     bool
 	widthMultiple int
 	heightMultiple int
-	justification int // 0:左, 1:中, 2:右
+	justification int
  
 	qrData []byte
 }
