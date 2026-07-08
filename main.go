@@ -12,20 +12,21 @@
 	)
 	// Config 定义配置文件结构
 	type Config struct {
-		LatestFile string `json:"latest_file"`
-		BackupDir  string `json:"backup_dir"`
-		ListenPort int    `json:"listen_port"`
+		LatestFile  string `json:"latest_file"`
+		BackupDir   string `json:"backup_dir"`
+		ListenPort  int    `json:"listen_port"`
+		MinDataSize int    `json:"min_data_size"` // 新增：最小有效数据字节阈值
 	}
 	// 全局配置实例
 	var appConfig = Config{
-		LatestFile: "latest.prn", // 默认值
-		BackupDir:  "./backups",  // 默认值
-		ListenPort: 9100,         // 默认端口
+		LatestFile:  "latest.prn",
+		BackupDir:   "./backups",
+		ListenPort:  9100,
+		MinDataSize: 10, // 默认小于10字节的连接视为无效探测，直接丢弃
 	}
 	const bufferSize = 64 * 1024 // 64KB 缓冲区
 	func main() {
 		// 1. 解析命令行参数
-		// 定义 -c 参数，默认值为 "config.json"，如果用户不传 -c，则尝试读取同目录下的 config.json
 		configPath := flag.String("c", "config.json", "指定配置文件路径 (例: -c /etc/posprinter/config.json)")
 		flag.Parse()
 		// 2. 加载配置文件
@@ -51,6 +52,7 @@
 		log.Printf("使用的配置文件: %s", *configPath)
 		log.Printf("主文件路径: %s", appConfig.LatestFile)
 		log.Printf("备份目录路径: %s", appConfig.BackupDir)
+		log.Printf("最小数据过滤阈值: %d 字节", appConfig.MinDataSize)
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
@@ -60,23 +62,22 @@
 			go handleConnection(conn)
 		}
 	}
-	// loadConfig 读取并解析指定路径的配置文件，失败则使用默认配置
+	// loadConfig 读取并解析指定路径的配置文件
 	func loadConfig(configPath string) {
 		data, err := os.ReadFile(configPath)
 		if err != nil {
 			if os.IsNotExist(err) {
-				log.Printf("未找到配置文件 '%s'，将使用默认配置和当前运行路径。\n", configPath)
+				log.Printf("未找到配置文件 '%s'，将使用默认配置。\n", configPath)
 			} else {
 				log.Printf("警告: 读取配置文件 '%s' 失败: %v，将使用默认配置。\n", configPath, err)
 			}
 			return
 		}
-		// 解析 JSON 到全局配置变量
 		if err := json.Unmarshal(data, &appConfig); err != nil {
 			log.Printf("警告: 解析配置文件 '%s' 失败: %v，将使用默认配置。\n", configPath, err)
 			return
 		}
-		// 如果配置文件中某项为空，回退到默认值
+		// 配置项为空或非法时回退到默认值
 		if appConfig.LatestFile == "" {
 			appConfig.LatestFile = "latest.prn"
 		}
@@ -86,11 +87,24 @@
 		if appConfig.ListenPort == 0 {
 			appConfig.ListenPort = 9100
 		}
+		if appConfig.MinDataSize <= 0 {
+			appConfig.MinDataSize = 10
+		}
 	}
 	func handleConnection(conn net.Conn) {
 		defer conn.Close()
 		clientAddr := conn.RemoteAddr().String()
-		log.Printf("收到来自 %s 的打印数据连接", clientAddr)
+		// === 核心检测逻辑：预读数据判断是否为小字节无效连接 ===
+		// 尝试读取设定的最小字节数
+		initialBuf := make([]byte, appConfig.MinDataSize)
+		n, err := io.ReadFull(conn, initialBuf)
+		// 如果读取到的字节数小于设定的阈值，说明是无效连接或端口探测，直接丢弃
+		if n < appConfig.MinDataSize {
+			log.Printf("丢弃无效连接: 来自 %s 的数据过小 (仅 %d 字节，阈值 %d 字节)。原因: %v",
+				clientAddr, n, appConfig.MinDataSize, err)
+			return
+		}
+		log.Printf("收到来自 %s 的打印数据连接，验证通过，开始写入...", clientAddr)
 		// 1. 准备覆盖写入的主文件
 		latestFile, err := os.Create(appConfig.LatestFile)
 		if err != nil {
@@ -108,13 +122,22 @@
 			return
 		}
 		defer backupFile.Close()
-		// 3. 同时接收数据并写入两个目标
+		// 3. 同时写入两个目标
 		writer := io.MultiWriter(latestFile, backupFile)
-		bytesCopied, err := io.CopyBuffer(writer, conn, make([]byte, bufferSize))
+		// 先将刚才预读到缓冲区的有效数据写入文件
+		_, err = writer.Write(initialBuf)
 		if err != nil {
-			log.Printf("数据传输异常 (来自 %s): %v", clientAddr, err)
+			log.Printf("写入初始数据失败: %v", err)
 			return
 		}
+		// 4. 继续接收并写入剩余的数据
+		remainingBytes, err := io.CopyBuffer(writer, conn, make([]byte, bufferSize))
+		if err != nil {
+			log.Printf("数据传输异常 (来自 %s): %v", clientAddr, err)
+			// 即使异常中断，已接收的部分也会被保存
+		}
+		// 总字节数 = 初始预读的字节 + 后续接收的字节
+		totalBytes := int64(n) + remainingBytes
 		log.Printf("来自 %s 的数据接收完成，共 %d 字节。已覆盖至 %s 并备份至 %s",
-			clientAddr, bytesCopied, appConfig.LatestFile, backupFilePath)
+			clientAddr, totalBytes, appConfig.LatestFile, backupFilePath)
 	}
