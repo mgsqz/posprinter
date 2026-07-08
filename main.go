@@ -2,6 +2,7 @@ package main
  
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"time"
  
+	"github.com/skip2/go-qrcode"
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
  
@@ -219,16 +221,10 @@ func handleConnection(conn net.Conn) {
 	if err != nil { return }
 	defer backupFile.Close()
  
-	// 核心：使用 bytes.Buffer 同时收集完整数据，供网页解析使用
 	var dataBuf bytes.Buffer
-	
-	// 将文件和 Buffer 同时作为写入目标
 	writer := io.MultiWriter(latestFile, backupFile, &dataBuf)
- 
-	// 1. 写入预读的数据
 	writer.Write(initialBuf)
  
-	// 2. 继续接收并写入剩余的数据
 	remainingBytes, err := io.CopyBuffer(writer, conn, make([]byte, bufferSize))
 	if err != nil {
 		log.Printf("数据传输异常 (来自 %s): %v", clientAddr, err)
@@ -237,97 +233,158 @@ func handleConnection(conn net.Conn) {
 	totalBytes := int64(n) + remainingBytes
 	log.Printf("来自 %s 接收完成，共 %d 字节", clientAddr, totalBytes)
  
-	// 3. 将完整数据解析为 HTML 并广播给网页
 	htmlStr := escToHTML(dataBuf.Bytes())
 	broker.Broadcast(htmlStr)
 }
  
-// === ESC/POS 转 HTML 解析器 ===
+// === ESC/POS 状态解析器 ===
+type parserState struct {
+	sb   strings.Builder
+	line strings.Builder
+ 
+	bold          bool
+	underline     bool
+	widthMultiple int
+	heightMultiple int
+	justification int // 0:左, 1:中, 2:右
+ 
+	qrData []byte
+}
+ 
+func (p *parserState) getStyle() string {
+	style := ""
+	if p.bold { style += "font-weight:bold;" }
+	if p.underline { style += "text-decoration:underline;" }
+	if p.justification == 1 { style += "text-align:center;" } else if p.justification == 2 { style += "text-align:right;" } else { style += "text-align:left;" }
+	
+	// 使用 CSS 缩放模拟双宽双高
+	if p.widthMultiple > 1 || p.heightMultiple > 1 {
+		style += fmt.Sprintf("display:inline-block; transform: scale(%d, %d); transform-origin: left;", p.widthMultiple, p.heightMultiple)
+	}
+	return style
+}
+ 
+func (p *parserState) flushLine() {
+	text := html.EscapeString(p.line.String())
+	text = strings.ReplaceAll(text, " ", "&nbsp;")
+	p.sb.WriteString(`<div style="` + p.getStyle() + `">` + text + `</div>`)
+	p.line.Reset()
+}
+ 
 func escToHTML(raw []byte) string {
 	utf8Data, err := simplifiedchinese.GBK.NewDecoder().Bytes(raw)
 	if err != nil {
 		utf8Data = raw
 	}
  
-	var sb strings.Builder
-	sb.WriteString(`<div style="font-family: 'Courier New', monospace; width: 100%;">`)
- 
-	var bold, underline bool
-	align := "left"
- 
-	getStyle := func() string {
-		s := ""
-		if bold { s += "font-weight:bold;" }
-		if underline { s += "text-decoration:underline;" }
-		s += "text-align:" + align + ";"
-		return s
+	p := &parserState{
+		widthMultiple: 1,
+		heightMultiple: 1,
 	}
- 
-	var line strings.Builder
-	flushLine := func() {
-		text := html.EscapeString(line.String())
-		text = strings.ReplaceAll(text, " ", "&nbsp;")
-		sb.WriteString(`<div style="` + getStyle() + `">` + text + `</div>`)
-		line.Reset()
-		align = "left"
-	}
+	p.sb.WriteString(`<div style="font-family: 'Courier New', monospace; width: 100%;">`)
  
 	i := 0
 	for i < len(utf8Data) {
 		b := utf8Data[i]
+ 
 		if b == 27 { // ESC
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				switch cmd {
 				case 64: // ESC @ 初始化
-					bold = false; underline = false; align = "left"; i += 2; continue
+					p.bold = false; p.underline = false; p.widthMultiple = 1; p.heightMultiple = 1; p.justification = 0
+					i += 2; continue
 				case 97: // ESC a n 对齐
 					if i+2 < len(utf8Data) {
-						switch utf8Data[i+2] {
-						case 0: align = "left"
-						case 1: align = "center"
-						case 2: align = "right"
-						}
+						p.justification = int(utf8Data[i+2])
 						i += 3; continue
 					}
 				case 69: // ESC E n 加粗
-					if i+2 < len(utf8Data) { bold = utf8Data[i+2] == 1; i += 3; continue }
+					if i+2 < len(utf8Data) { p.bold = utf8Data[i+2] == 1; i += 3; continue }
 				case 45: // ESC - n 下划线
-					if i+2 < len(utf8Data) { underline = utf8Data[i+2] == 1; i += 3; continue }
-				case 33: // ESC ! n 字体模式
-					if i+2 < len(utf8Data) { bold = (utf8Data[i+2] & 8) != 0; i += 3; continue }
-				case 100: // ESC d n 打印并走纸n行
-					flushLine()
+					if i+2 < len(utf8Data) { p.underline = utf8Data[i+2] == 1; i += 3; continue }
+				case 33: // ESC ! n 字体综合模式
 					if i+2 < len(utf8Data) {
-						for j := 0; j < int(utf8Data[i+2]); j++ { sb.WriteString("<br>") }
+						n := utf8Data[i+2]
+						p.bold = (n & 8) != 0
+						p.heightMultiple = 1; p.widthMultiple = 1
+						if (n & 16) != 0 { p.heightMultiple = 2 }
+						if (n & 32) != 0 { p.widthMultiple = 2 }
+						i += 3; continue
+					}
+				case 100: // ESC d n 走纸n行
+					p.flushLine()
+					if i+2 < len(utf8Data) {
+						for j := 0; j < int(utf8Data[i+2]); j++ { p.sb.WriteString("<br>") }
 						i += 3; continue
 					}
 				}
+				i += 2; continue // 未知ESC安全跳过2字节
 			}
+			i++; continue
 		} else if b == 29 { // GS
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
-				switch cmd {
-				case 33: // GS ! n 字体大小
-					if i+2 < len(utf8Data) { i += 3; continue }
-				case 86: // GS V 切纸
-					flushLine()
-					sb.WriteString(`<hr style="border-top: 1px dashed #000; margin: 10px 0;">`)
-					i += 2; continue
+				if cmd == 40 && i+4 < len(utf8Data) && utf8Data[i+2] == 107 { // GS ( k (QR码)
+					pL := int(utf8Data[i+3])
+					pH := int(utf8Data[i+4])
+					lenPayload := pH*256 + pL
+					start := i + 5
+					end := start + lenPayload - 2
+					if end <= len(utf8Data) {
+						cn := utf8Data[start]
+						fn := utf8Data[start+1]
+						if cn == 49 { // QR Code
+							payload := utf8Data[start+2 : end]
+							switch fn {
+							case 80: // 存储数据
+								if len(payload) > 0 {
+									p.qrData = append(p.qrData, payload[1:]...) // 跳过 m
+								}
+							case 81: // 打印QR码
+								if len(p.qrData) > 0 {
+									png, err := qrcode.Encode(string(p.qrData), qrcode.Medium, 256)
+									if err == nil {
+										b64 := base64.StdEncoding.EncodeToString(png)
+										p.line.WriteString(fmt.Sprintf(`<img src="data:image/png;base64,%s" style="max-width:200px;"/>`, b64))
+									}
+									p.qrData = []byte{}
+								}
+							}
+						}
+						i = end; continue
+					}
+				} else {
+					switch cmd {
+					case 33: // GS ! n 字体大小
+						if i+2 < len(utf8Data) {
+							n := utf8Data[i+2]
+							p.widthMultiple = int(n>>4)&0x0F + 1
+							p.heightMultiple = int(n)&0x0F + 1
+							i += 3; continue
+						}
+					case 86: // GS V 切纸
+						p.flushLine()
+						p.sb.WriteString(`<hr style="border-top: 1px dashed #000; margin: 10px 0;">`)
+						i += 2; continue
+					}
 				}
+				i += 2; continue // 未知GS安全跳过2字节
 			}
+			i++; continue
 		} else if b == 10 { // LF 换行
-			flushLine()
+			p.flushLine()
 			i++; continue
 		} else if b == 13 { // CR 回车
 			i++; continue
+		} else if b < 32 { // 其他控制字符丢弃
+			i++; continue
 		} else {
-			line.WriteByte(b)
+			p.line.WriteByte(b)
 			i++; continue
 		}
-		i++
 	}
-	flushLine()
-	sb.WriteString(`</div>`)
-	return sb.String()
+	p.flushLine()
+	p.sb.WriteString(`</div>`)
+	return p.sb.String()
 }
