@@ -8,14 +8,12 @@ import (
 	"flag"
 	"fmt"
 	"html"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
  
@@ -36,49 +34,6 @@ var appConfig = Config{
 	BackupDir:  "./backups",
 	ListenPort: 9100,
 	WebPort:    8080,
-}
- 
-// === SSE 广播器实现 ===
-type Broker struct {
-	clients     map[chan string]bool
-	mutex       sync.Mutex
-	lastMessage string
-}
- 
-var broker = NewBroker()
- 
-func NewBroker() *Broker {
-	return &Broker{clients: make(map[chan string]bool)}
-}
- 
-func (b *Broker) AddClient() chan string {
-	ch := make(chan string, 10)
-	b.mutex.Lock()
-	b.clients[ch] = true
-	if b.lastMessage != "" {
-		ch <- b.lastMessage
-	}
-	b.mutex.Unlock()
-	return ch
-}
- 
-func (b *Broker) RemoveClient(ch chan string) {
-	b.mutex.Lock()
-	delete(b.clients, ch)
-	close(ch)
-	b.mutex.Unlock()
-}
- 
-func (b *Broker) Broadcast(msg string) {
-	b.mutex.Lock()
-	b.lastMessage = msg
-	for ch := range b.clients {
-		select {
-		case ch <- msg:
-		default:
-		}
-	}
-	b.mutex.Unlock()
 }
  
 func main() {
@@ -118,9 +73,10 @@ func main() {
 	}
 }
  
+// === Web 服务 ===
 func startWebServer() {
 	http.HandleFunc("/", indexHandler)
-	http.HandleFunc("/events", sseHandler)
+	http.HandleFunc("/data", dataHandler)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", appConfig.WebPort), nil))
 }
  
@@ -144,14 +100,19 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
         <div id="receipt"></div>
     </div>
     <script>
-        const evtSource = new EventSource('/events');
-        const receiptDiv = document.getElementById('receipt');
-        const statusDiv = document.getElementById('status');
-        
-        evtSource.onmessage = function(e) {
-            receiptDiv.innerHTML = e.data;
-            statusDiv.innerText = "最后更新: " + new Date().toLocaleTimeString();
-        };
+        // 客户端每秒主动刷新请求最新数据
+        async function fetchReceipt() {
+            try {
+                const response = await fetch('/data?ts=' + new Date().getTime());
+                if (response.ok) {
+                    const html = await response.text();
+                    document.getElementById('receipt').innerHTML = html;
+                    document.getElementById('status').innerText = "最后刷新: " + new Date().toLocaleTimeString();
+                }
+            } catch (e) {}
+        }
+        setInterval(fetchReceipt, 1000); // 每秒执行一次
+        fetchReceipt(); // 首次立即执行
     </script>
 </body>
 </html>`
@@ -159,30 +120,17 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, htmlContent)
 }
  
-func sseHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
- 
-	ch := broker.AddClient()
-	defer broker.RemoveClient(ch)
- 
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
- 
-	for {
-		select {
-		case msg := <-ch:
-			encodedMsg := strings.ReplaceAll(msg, "\n", "\ndata: ")
-			fmt.Fprintf(w, "data: %s\n\n", encodedMsg)
-			if f, ok := w.(http.Flusher); ok { f.Flush() }
-		case <-ticker.C:
-			fmt.Fprintf(w, "event: ping\ndata: \n\n")
-			if f, ok := w.(http.Flusher); ok { f.Flush() }
-		case <-r.Context().Done():
-			return
-		}
+func dataHandler(w http.ResponseWriter, r *http.Request) {
+	// 每次请求时，直接从磁盘读取 latest.prn 并解析返回
+	rawData, err := os.ReadFile(appConfig.LatestFile)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(`<div style="color:#999;">暂无打印数据</div>`))
+		return
 	}
+	htmlStr := escToHTML(rawData)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(htmlStr))
 }
  
 func loadConfig(configPath string) {
@@ -201,6 +149,7 @@ func loadConfig(configPath string) {
 	if appConfig.WebPort == 0 { appConfig.WebPort = 8080 }
 }
  
+// === TCP 接收处理 ===
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	clientAddr := conn.RemoteAddr().String()
@@ -210,7 +159,6 @@ func handleConnection(conn net.Conn) {
  
 	log.Printf("收到来自 %s 的连接，开始监听流...", clientAddr)
  
-	// 核心：先缓存到内存，延迟写盘
 	var dataBuf bytes.Buffer
 	reader := bufio.NewReader(conn)
 	totalBytes := 0
@@ -315,9 +263,6 @@ func handleConnection(conn net.Conn) {
  
 	latestFile.Write(dataBuf.Bytes())
 	backupFile.Write(dataBuf.Bytes())
- 
-	htmlStr := escToHTML(dataBuf.Bytes())
-	broker.Broadcast(htmlStr)
 }
  
 // === ESC/POS 状态解析器 ===
