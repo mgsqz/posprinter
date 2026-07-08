@@ -88,106 +88,24 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
     <meta charset="UTF-8">
     <title>ESC/POS 实时小票预览</title>
     <style>
-        body { margin: 0; background-color: #f0f0f0; font-family: sans-serif; text-align: center; padding: 20px; }
+        body { background-color: #f0f0f0; font-family: sans-serif; text-align: center; padding: 20px; margin: 0; }
         .receipt-container { background: #fff; padding: 20px; box-shadow: 0 0 15px rgba(0,0,0,0.1); display: inline-block; min-height: 500px; }
         .status { color: #888; margin-bottom: 10px; }
         
-        /* 完全复刻参考项目的 CSS */
+        /* 核心容器：限制为 80mm 宽度，防止内容撑爆 */
         .esc-receipt {
-          border: 1px solid #888;
-          font-family: monospace;
-          padding: 1em;
-          width: 80mm; 
-          display: inline-block;
+          font-family: 'Courier New', monospace;
+          font-size: 14px;
+          width: 280px; /* 约等于 80mm */
           text-align: left;
+          display: inline-block;
         }
-        .esc-line { white-space: pre; }
-        .esc-emphasis { font-weight: bold; }
-        .esc-justify-center .esc-text-scaled { transform-origin: 50% 0; }
-        .esc-justify-right .esc-text-scaled { transform-origin: 100% 0; }
-        .esc-justify-center { text-align: center; }
-        .esc-justify-right { text-align: right; }
-        .esc-text-scaled { display: inline-block; transform-origin: 0 0; }
-        .esc-justify-center .esc-bitimage { margin-left: auto; margin-right: auto; }
-        .esc-justify-right .esc-bitimage { margin-left: auto; }
-        .esc-underline { border-bottom: 2px solid #000; }
-        .esc-underline-double { border-bottom: 2px solid #000; }
-        .esc-invert { background: #000; color: #fff; }
-        .esc-upside-down { transform: rotate(180deg); }
-        .esc-font-b { font-size: 75% }
-        .esc-line-command { text-align: center; font-weight: bold; background: linear-gradient(180deg, rgba(0,0,0,0) calc(50% - 1px), rgba(192,192,192,1) calc(50%), rgba(0,0,0,0) calc(50% + 1px)); }
-        .esc-line-command .command { background-color: white; padding: 1px 10px 1px 10px; }
-        span { display: inline-block; }
-        .esc-width-2 { transform: scale(2, 1); }
-        .esc-width-3 { transform: scale(3, 1); }
-        .esc-width-4 { transform: scale(4, 1); }
-        .esc-width-5 { transform: scale(5, 1); }
-        .esc-width-6 { transform: scale(6, 1); }
-        .esc-width-7 { transform: scale(7, 1); }
-        .esc-width-8 { transform: scale(8, 1); }
-        .esc-height-2 { transform: scale(1, 2); margin-bottom: 1em; }
-        .esc-height-3 { transform: scale(1, 3); margin-bottom: 2em; }
-        .esc-height-4 { transform: scale(1, 4); margin-bottom: 3em; }
-        .esc-height-5 { transform: scale(1, 5); margin-bottom: 4em; }
-        .esc-height-6 { transform: scale(1, 6); margin-bottom: 5em; }
-        .esc-height-7 { transform: scale(1, 7); margin-bottom: 6em; }
-        .esc-height-8 { transform: scale(1, 8); margin-bottom: 7em; }
-        .esc-width-2-height-2 { transform: scale(2, 2); margin-bottom: 1em; }
-        .esc-width-2-height-3 { transform: scale(2, 3); margin-bottom: 2em; }
-        .esc-width-2-height-4 { transform: scale(2, 4); margin-bottom: 3em; }
-        .esc-width-2-height-5 { transform: scale(2, 5); margin-bottom: 4em; }
-        .esc-width-2-height-6 { transform: scale(2, 6); margin-bottom: 5em; }
-        .esc-width-2-height-7 { transform: scale(2, 7); margin-bottom: 6em; }
-        .esc-width-2-height-8 { transform: scale(2, 8); margin-bottom: 7em; }
-        .esc-width-3-height-2 { transform: scale(3, 2); margin-bottom: 1em; }
-        .esc-width-3-height-3 { transform: scale(3, 3); margin-bottom: 2em; }
-        .esc-width-3-height-4 { transform: scale(3, 4); margin-bottom: 3em; }
-        .esc-width-3-height-5 { transform: scale(3, 5); margin-bottom: 4em; }
-        .esc-width-3-height-6 { transform: scale(3, 6); margin-bottom: 5em; }
-        .esc-width-3-height-7 { transform: scale(3, 7); margin-bottom: 6em; }
-        .esc-width-3-height-8 { transform: scale(3, 8); margin-bottom: 7em; }
-        .esc-width-4-height-2 { transform: scale(4, 2); margin-bottom: 1em; }
-        .esc-width-4-height-3 { transform: scale(4, 3); margin-bottom: 2em; }
-        .esc-width-4-height-4 { transform: scale(4, 4); margin-bottom: 3em; }
-        .esc-width-4-height-5 { transform: scale(4, 5); margin-bottom: 4em; }
-        .esc-width-4-height-6 { transform: scale(4, 6); margin-bottom: 5em; }
-        .esc-width-4-height-7 { transform: scale(4, 7); margin-bottom: 6em; }
-        .esc-width-4-height-8 { transform: scale(4, 8); margin-bottom: 7em; }
-        .esc-width-5-height-2 { transform: scale(5, 2); margin-bottom: 1em; }
-        .esc-width-5-height-3 { transform: scale(5, 3); margin-bottom: 2em; }
-        .esc-width-5-height-4 { transform: scale(5, 4); margin-bottom: 3em; }
-        .esc-width-5-height-5 { transform: scale(5, 5); margin-bottom: 4em; }
-        .esc-width-5-height-6 { transform: scale(5, 6); margin-bottom: 5em; }
-        .esc-width-5-height-7 { transform: scale(5, 7); margin-bottom: 6em; }
-        .esc-width-5-height-8 { transform: scale(5, 8); margin-bottom: 7em; }
-        .esc-width-6-height-2 { transform: scale(6, 2); margin-bottom: 1em; }
-        .esc-width-6-height-3 { transform: scale(6, 3); margin-bottom: 2em; }
-        .esc-width-6-height-4 { transform: scale(6, 4); margin-bottom: 3em; }
-        .esc-width-6-height-5 { transform: scale(6, 5); margin-bottom: 4em; }
-        .esc-width-6-height-6 { transform: scale(6, 6); margin-bottom: 5em; }
-        .esc-width-6-height-7 { transform: scale(6, 7); margin-bottom: 6em; }
-        .esc-width-6-height-8 { transform: scale(6, 8); margin-bottom: 7em; }
-        .esc-width-7-height-2 { transform: scale(7, 2); margin-bottom: 1em; }
-        .esc-width-7-height-3 { transform: scale(7, 3); margin-bottom: 2em; }
-        .esc-width-7-height-4 { transform: scale(7, 4); margin-bottom: 3em; }
-        .esc-width-7-height-5 { transform: scale(7, 5); margin-bottom: 4em; }
-        .esc-width-7-height-6 { transform: scale(7, 6); margin-bottom: 5em; }
-        .esc-width-7-height-7 { transform: scale(7, 7); margin-bottom: 6em; }
-        .esc-width-7-height-8 { transform: scale(7, 8); margin-bottom: 7em; }
-        .esc-width-8-height-2 { transform: scale(8, 2); margin-bottom: 1em; }
-        .esc-width-8-height-3 { transform: scale(8, 3); margin-bottom: 2em; }
-        .esc-width-8-height-4 { transform: scale(8, 4); margin-bottom: 3em; }
-        .esc-width-8-height-5 { transform: scale(8, 5); margin-bottom: 4em; }
-        .esc-width-8-height-6 { transform: scale(8, 6); margin-bottom: 5em; }
-        .esc-width-8-height-7 { transform: scale(8, 7); margin-bottom: 6em; }
-        .esc-width-8-height-8 { transform: scale(8, 8); margin-bottom: 7em; }
-        .esc-bitimage { display: block; }
     </style>
 </head>
 <body>
     <div class="status" id="status">等待打印数据...</div>
     <div class="receipt-container">
-        <div id="receipt"></div>
+        <div id="receipt" class="esc-receipt"></div>
     </div>
     <script>
         async function fetchReceipt() {
@@ -353,7 +271,7 @@ func handleConnection(conn net.Conn) {
 	backupFile.Write(dataBuf.Bytes())
 }
  
-// === ESC/POS 状态解析器 (使用与 PHP 完全一致的 class 机制) ===
+// === ESC/POS 状态解析器 (精确还原宽高缩放且防撑爆) ===
 type parserState struct {
 	sb      strings.Builder
 	lineBuf strings.Builder
@@ -365,33 +283,37 @@ type parserState struct {
 	heightMultiple int
 	justification int
  
+	maxHeight int // 记录当前行最大高度倍数
+ 
 	qrData []byte
 }
  
 func (p *parserState) flushText() {
 	if p.textBuf.Len() > 0 {
-		// 限制最大倍数，与 PHP 代码一致
-		if p.widthMultiple > 8 { p.widthMultiple = 8 }
-		if p.heightMultiple > 8 { p.heightMultiple = 8 }
- 
 		text := html.EscapeString(p.textBuf.String())
 		text = strings.ReplaceAll(text, " ", "&nbsp;")
 		
-		classes := []string{}
-		if p.bold { classes = append(classes, "esc-emphasis") }
-		if p.underline { classes = append(classes, "esc-underline") }
+		style := ""
+		if p.bold { style += "font-weight:bold;" }
+		if p.underline { style += "text-decoration:underline;" }
 		
-		if p.widthMultiple > 1 || p.heightMultiple > 1 {
-			classes = append(classes, "esc-text-scaled")
-			widthClass := ""
-			if p.widthMultiple > 1 { widthClass = "-width-" + fmt.Sprintf("%d", p.widthMultiple) }
-			heightClass := ""
-			if p.heightMultiple > 1 { heightClass = "-height-" + fmt.Sprintf("%d", p.heightMultiple) }
-			classes = append(classes, "esc" + widthClass + heightClass)
+		// 记录当前行所需行高
+		if p.heightMultiple > p.maxHeight {
+			p.maxHeight = p.heightMultiple
 		}
-		
-		if len(classes) > 0 {
-			p.lineBuf.WriteString(`<span class="` + strings.Join(classes, " ") + `">` + text + `</span>`)
+ 
+		// 仅在需要缩放时才包裹 span，避免普通文本因 inline-block 引发断行
+		if p.widthMultiple > 1 || p.heightMultiple > 1 {
+			style += "display: inline-block;"
+			if p.heightMultiple > 1 {
+				// 纯垂直拉伸，确保宽度绝对不变
+				style += fmt.Sprintf("transform: scaleY(%d); transform-origin: bottom;", p.heightMultiple)
+			}
+			if p.widthMultiple > 1 {
+				// 利用字间距模拟宽度增加，避免 scale 导致容器撑爆换行
+				style += fmt.Sprintf("letter-spacing: %.2fem;", 0.6 * float64(p.widthMultiple - 1))
+			}
+			p.lineBuf.WriteString(`<span style="` + style + `">` + text + `</span>`)
 		} else {
 			p.lineBuf.WriteString(text)
 		}
@@ -402,17 +324,19 @@ func (p *parserState) flushText() {
 func (p *parserState) flushLine() {
 	p.flushText()
 	
-	classes := []string{"esc-line"}
-	if p.justification == 1 { classes = append(classes, "esc-justify-center") } else if p.justification == 2 { classes = append(classes, "esc-justify-right") }
+	align := "left"
+	if p.justification == 1 { align = "center" } else if p.justification == 2 { align = "right" }
 	
-	classesStr := strings.Join(classes, " ")
+	// 为当前行设置精确的行高，避免垂直拉伸的文字与上下行重叠
+	divStyle := "white-space: pre-wrap; text-align:" + align + "; line-height: " + fmt.Sprintf("%d", p.maxHeight) + ";"
 	
 	if p.lineBuf.Len() == 0 {
-		p.sb.WriteString(`<div class="` + classesStr + `">&nbsp;</div>`)
+		p.sb.WriteString(`<div style="` + divStyle + `">&nbsp;</div>`)
 	} else {
-		p.sb.WriteString(`<div class="` + classesStr + `">` + p.lineBuf.String() + `</div>`)
+		p.sb.WriteString(`<div style="` + divStyle + `">` + p.lineBuf.String() + `</div>`)
 	}
 	p.lineBuf.Reset()
+	p.maxHeight = 1 // 重置行高
 }
  
 func escToHTML(raw []byte) string {
@@ -431,8 +355,8 @@ func escToHTML(raw []byte) string {
 	p := &parserState{
 		widthMultiple:  1,
 		heightMultiple: 1,
+		maxHeight:      1,
 	}
-	p.sb.WriteString(`<div class="esc-receipt">`)
  
 	i := 0
 	for i < len(utf8Data) {
@@ -500,7 +424,7 @@ func escToHTML(raw []byte) string {
 									png, err := qrcode.Encode(string(p.qrData), qrcode.Medium, 256)
 									if err == nil {
 										b64 := base64.StdEncoding.EncodeToString(png)
-										p.lineBuf.WriteString(fmt.Sprintf(`<img class="esc-bitimage" src="data:image/png;base64,%s" style="max-width:200px;"/>`, b64))
+										p.lineBuf.WriteString(fmt.Sprintf(`<img src="data:image/png;base64,%s" style="max-width:200px;"/>`, b64))
 									}
 									p.qrData = []byte{}
 								}
@@ -572,6 +496,5 @@ func escToHTML(raw []byte) string {
 		}
 	}
 	p.flushLine()
-	p.sb.WriteString(`</div>`)
 	return p.sb.String()
 }
