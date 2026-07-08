@@ -92,7 +92,6 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
         .receipt-container { background: #fff; padding: 20px; box-shadow: 0 0 15px rgba(0,0,0,0.1); display: inline-block; min-height: 500px; }
         .status { color: #888; margin-bottom: 10px; }
         
-        /* 核心容器：限制为 80mm 宽度，防止内容撑爆 */
         .esc-receipt {
           font-family: 'Courier New', monospace;
           font-size: 14px;
@@ -271,7 +270,7 @@ func handleConnection(conn net.Conn) {
 	backupFile.Write(dataBuf.Bytes())
 }
  
-// === ESC/POS 状态解析器 (精确还原宽高缩放且防撑爆) ===
+// === ESC/POS 状态解析器 (完美解决行高堆叠重叠) ===
 type parserState struct {
 	sb      strings.Builder
 	lineBuf strings.Builder
@@ -282,8 +281,6 @@ type parserState struct {
 	widthMultiple int
 	heightMultiple int
 	justification int
- 
-	maxHeight int // 记录当前行最大高度倍数
  
 	qrData []byte
 }
@@ -297,20 +294,14 @@ func (p *parserState) flushText() {
 		if p.bold { style += "font-weight:bold;" }
 		if p.underline { style += "text-decoration:underline;" }
 		
-		// 记录当前行所需行高
-		if p.heightMultiple > p.maxHeight {
-			p.maxHeight = p.heightMultiple
-		}
- 
-		// 仅在需要缩放时才包裹 span，避免普通文本因 inline-block 引发断行
 		if p.widthMultiple > 1 || p.heightMultiple > 1 {
-			style += "display: inline-block;"
+			style += "display: inline-block; vertical-align: top;"
 			if p.heightMultiple > 1 {
-				// 纯垂直拉伸，确保宽度绝对不变
-				style += fmt.Sprintf("transform: scaleY(%d); transform-origin: bottom;", p.heightMultiple)
+				// 核心修复：以顶部为原点向下拉伸，并用 margin-bottom 撑开文档流高度，彻底消除上下行重叠
+				marginVal := p.heightMultiple - 1
+				style += fmt.Sprintf("transform: scaleY(%d); transform-origin: top left; margin-bottom: %dem;", p.heightMultiple, marginVal)
 			}
 			if p.widthMultiple > 1 {
-				// 利用字间距模拟宽度增加，避免 scale 导致容器撑爆换行
 				style += fmt.Sprintf("letter-spacing: %.2fem;", 0.6 * float64(p.widthMultiple - 1))
 			}
 			p.lineBuf.WriteString(`<span style="` + style + `">` + text + `</span>`)
@@ -327,8 +318,8 @@ func (p *parserState) flushLine() {
 	align := "left"
 	if p.justification == 1 { align = "center" } else if p.justification == 2 { align = "right" }
 	
-	// 为当前行设置精确的行高，避免垂直拉伸的文字与上下行重叠
-	divStyle := "white-space: pre-wrap; text-align:" + align + "; line-height: " + fmt.Sprintf("%d", p.maxHeight) + ";"
+	// 移除强制 line-height，完全依赖 span 的 margin-bottom 自然撑开高度
+	divStyle := "white-space: pre-wrap; text-align:" + align + ";"
 	
 	if p.lineBuf.Len() == 0 {
 		p.sb.WriteString(`<div style="` + divStyle + `">&nbsp;</div>`)
@@ -336,7 +327,6 @@ func (p *parserState) flushLine() {
 		p.sb.WriteString(`<div style="` + divStyle + `">` + p.lineBuf.String() + `</div>`)
 	}
 	p.lineBuf.Reset()
-	p.maxHeight = 1 // 重置行高
 }
  
 func escToHTML(raw []byte) string {
@@ -355,7 +345,6 @@ func escToHTML(raw []byte) string {
 	p := &parserState{
 		widthMultiple:  1,
 		heightMultiple: 1,
-		maxHeight:      1,
 	}
  
 	i := 0
