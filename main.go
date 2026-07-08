@@ -255,11 +255,14 @@ func (p *parserState) getStyle() string {
 	style := ""
 	if p.bold { style += "font-weight:bold;" }
 	if p.underline { style += "text-decoration:underline;" }
+	
 	if p.justification == 1 { style += "text-align:center;" } else if p.justification == 2 { style += "text-align:right;" } else { style += "text-align:left;" }
 	
-	// 使用 CSS 缩放模拟双宽双高
+	// 使用 font-size 和 line-height 模拟双宽双高，避免 transform 导致的重叠错位
 	if p.widthMultiple > 1 || p.heightMultiple > 1 {
-		style += fmt.Sprintf("display:inline-block; transform: scale(%d, %d); transform-origin: left;", p.widthMultiple, p.heightMultiple)
+		fontSize := 14 * p.widthMultiple
+		lineHeight := 100 * p.heightMultiple
+		style += fmt.Sprintf("font-size:%dpx; line-height:%d%%;", fontSize, lineHeight)
 	}
 	return style
 }
@@ -278,7 +281,7 @@ func escToHTML(raw []byte) string {
 	}
  
 	p := &parserState{
-		widthMultiple: 1,
+		widthMultiple:  1,
 		heightMultiple: 1,
 	}
 	p.sb.WriteString(`<div style="font-family: 'Courier New', monospace; width: 100%;">`)
@@ -295,18 +298,16 @@ func escToHTML(raw []byte) string {
 					p.bold = false; p.underline = false; p.widthMultiple = 1; p.heightMultiple = 1; p.justification = 0
 					i += 2; continue
 				case 97: // ESC a n 对齐
-					if i+2 < len(utf8Data) {
-						p.justification = int(utf8Data[i+2])
-						i += 3; continue
-					}
+					if i+2 < len(utf8Data) { p.justification = int(utf8Data[i+2]); i += 3; continue }
 				case 69: // ESC E n 加粗
 					if i+2 < len(utf8Data) { p.bold = utf8Data[i+2] == 1; i += 3; continue }
 				case 45: // ESC - n 下划线
 					if i+2 < len(utf8Data) { p.underline = utf8Data[i+2] == 1; i += 3; continue }
-				case 33: // ESC ! n 字体综合模式
+				case 33: // ESC ! n 英文字体模式
 					if i+2 < len(utf8Data) {
 						n := utf8Data[i+2]
 						p.bold = (n & 8) != 0
+						p.underline = (n & 128) != 0
 						p.heightMultiple = 1; p.widthMultiple = 1
 						if (n & 16) != 0 { p.heightMultiple = 2 }
 						if (n & 32) != 0 { p.widthMultiple = 2 }
@@ -318,6 +319,10 @@ func escToHTML(raw []byte) string {
 						for j := 0; j < int(utf8Data[i+2]); j++ { p.sb.WriteString("<br>") }
 						i += 3; continue
 					}
+				case 50: // ESC 2 默认行距
+					i += 2; continue
+				case 51, 74, 77, 82, 85, 86, 99, 103, 123, 32: // ESC 3 n, ESC J n 等带1个参数的指令
+					if i+2 < len(utf8Data) { i += 3; continue }
 				}
 				i += 2; continue // 未知ESC安全跳过2字节
 			}
@@ -338,9 +343,7 @@ func escToHTML(raw []byte) string {
 							payload := utf8Data[start+2 : end]
 							switch fn {
 							case 80: // 存储数据
-								if len(payload) > 0 {
-									p.qrData = append(p.qrData, payload[1:]...) // 跳过 m
-								}
+								if len(payload) > 0 { p.qrData = append(p.qrData, payload[1:]...) }
 							case 81: // 打印QR码
 								if len(p.qrData) > 0 {
 									png, err := qrcode.Encode(string(p.qrData), qrcode.Medium, 256)
@@ -356,7 +359,7 @@ func escToHTML(raw []byte) string {
 					}
 				} else {
 					switch cmd {
-					case 33: // GS ! n 字体大小
+					case 33: // GS ! n 英文字体大小
 						if i+2 < len(utf8Data) {
 							n := utf8Data[i+2]
 							p.widthMultiple = int(n>>4)&0x0F + 1
@@ -366,10 +369,40 @@ func escToHTML(raw []byte) string {
 					case 86: // GS V 切纸
 						p.flushLine()
 						p.sb.WriteString(`<hr style="border-top: 1px dashed #000; margin: 10px 0;">`)
+						if i+2 < len(utf8Data) { i += 3; continue }
+						i += 2; continue
+					case 72, 81, 102, 104, 119, 66: // GS H n, GS B n 等带1参数
+						if i+2 < len(utf8Data) { i += 3; continue }
+					case 76, 87: // GS L nL nH, GS W nL nH 带2参数
+						if i+3 < len(utf8Data) { i += 4; continue }
+					case 50: // GS 2
 						i += 2; continue
 					}
+					i += 2; continue
 				}
-				i += 2; continue // 未知GS安全跳过2字节
+			}
+			i++; continue
+		} else if b == 28 { // FS 指令 (汉字处理)
+			if i+1 < len(utf8Data) {
+				cmd := utf8Data[i+1]
+				switch cmd {
+				case 33: // FS ! n 汉字字体模式 (核心修复：处理中文放大)
+					if i+2 < len(utf8Data) {
+						n := utf8Data[i+2]
+						p.bold = (n & 16) != 0
+						p.underline = (n & 32) != 0
+						p.widthMultiple = int(n&0x03) + 1
+						p.heightMultiple = int((n>>2)&0x03) + 1
+						i += 3; continue
+					}
+				case 38, 46: // FS & , FS . (无参数)
+					i += 2; continue
+				case 83: // FS S n1 n2 (2参数)
+					if i+3 < len(utf8Data) { i += 4; continue }
+				case 67, 73, 74, 99, 110, 45: // FS C n 等带1参数
+					if i+2 < len(utf8Data) { i += 3; continue }
+				}
+				i += 2; continue
 			}
 			i++; continue
 		} else if b == 10 { // LF 换行
