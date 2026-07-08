@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
  
 	"github.com/skip2/go-qrcode"
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -258,7 +259,6 @@ func (p *parserState) getStyle() string {
 	
 	if p.justification == 1 { style += "text-align:center;" } else if p.justification == 2 { style += "text-align:right;" } else { style += "text-align:left;" }
 	
-	// 使用 font-size 和 line-height 模拟双宽双高，避免 transform 导致的重叠错位
 	if p.widthMultiple > 1 || p.heightMultiple > 1 {
 		fontSize := 14 * p.widthMultiple
 		lineHeight := 100 * p.heightMultiple
@@ -275,9 +275,17 @@ func (p *parserState) flushLine() {
 }
  
 func escToHTML(raw []byte) string {
-	utf8Data, err := simplifiedchinese.GBK.NewDecoder().Bytes(raw)
-	if err != nil {
+	// 核心修复：自动检测编码，如果已经是 UTF-8 则直接使用，避免 GBK 解码器破坏控制字符
+	var utf8Data []byte
+	if utf8.Valid(raw) {
 		utf8Data = raw
+	} else {
+		decoded, err := simplifiedchinese.GBK.NewDecoder().Bytes(raw)
+		if err == nil {
+			utf8Data = decoded
+		} else {
+			utf8Data = raw
+		}
 	}
  
 	p := &parserState{
@@ -290,7 +298,7 @@ func escToHTML(raw []byte) string {
 	for i < len(utf8Data) {
 		b := utf8Data[i]
  
-		if b == 27 { // ESC
+		if b == 27 { // ESC (0x1b)
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				switch cmd {
@@ -319,15 +327,15 @@ func escToHTML(raw []byte) string {
 						for j := 0; j < int(utf8Data[i+2]); j++ { p.sb.WriteString("<br>") }
 						i += 3; continue
 					}
-				case 50: // ESC 2 默认行距
+				case 50: // ESC 2
 					i += 2; continue
-				case 51, 74, 77, 82, 85, 86, 99, 103, 123, 32: // ESC 3 n, ESC J n 等带1个参数的指令
+				case 51, 74, 77, 82, 85, 86, 99, 103, 123, 32: // ESC 3 n 等带1参数
 					if i+2 < len(utf8Data) { i += 3; continue }
 				}
 				i += 2; continue // 未知ESC安全跳过2字节
 			}
 			i++; continue
-		} else if b == 29 { // GS
+		} else if b == 29 { // GS (0x1d)
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				if cmd == 40 && i+4 < len(utf8Data) && utf8Data[i+2] == 107 { // GS ( k (QR码)
@@ -371,9 +379,9 @@ func escToHTML(raw []byte) string {
 						p.sb.WriteString(`<hr style="border-top: 1px dashed #000; margin: 10px 0;">`)
 						if i+2 < len(utf8Data) { i += 3; continue }
 						i += 2; continue
-					case 72, 81, 102, 104, 119, 66: // GS H n, GS B n 等带1参数
+					case 72, 81, 102, 104, 119, 66: // GS H n 等带1参数
 						if i+2 < len(utf8Data) { i += 3; continue }
-					case 76, 87: // GS L nL nH, GS W nL nH 带2参数
+					case 76, 87: // GS L nL nH 带2参数
 						if i+3 < len(utf8Data) { i += 4; continue }
 					case 50: // GS 2
 						i += 2; continue
@@ -382,11 +390,11 @@ func escToHTML(raw []byte) string {
 				}
 			}
 			i++; continue
-		} else if b == 28 { // FS 指令 (汉字处理)
+		} else if b == 28 { // FS (0x1c) 指令 (汉字处理)
 			if i+1 < len(utf8Data) {
 				cmd := utf8Data[i+1]
 				switch cmd {
-				case 33: // FS ! n 汉字字体模式 (核心修复：处理中文放大)
+				case 33: // FS ! n 汉字字体模式
 					if i+2 < len(utf8Data) {
 						n := utf8Data[i+2]
 						p.bold = (n & 16) != 0
@@ -395,11 +403,11 @@ func escToHTML(raw []byte) string {
 						p.heightMultiple = int((n>>2)&0x03) + 1
 						i += 3; continue
 					}
-				case 38, 46: // FS & , FS . (无参数)
+				case 38, 46: // FS & , FS .
 					i += 2; continue
-				case 83: // FS S n1 n2 (2参数)
+				case 83: // FS S n1 n2
 					if i+3 < len(utf8Data) { i += 4; continue }
-				case 67, 73, 74, 99, 110, 45: // FS C n 等带1参数
+				case 67, 73, 74, 99, 110, 45: // FS C n 等
 					if i+2 < len(utf8Data) { i += 3; continue }
 				}
 				i += 2; continue
