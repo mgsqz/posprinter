@@ -43,8 +43,9 @@ const bufferSize = 64 * 1024
  
 // === SSE 广播器实现 ===
 type Broker struct {
-	clients map[chan string]bool
-	mutex   sync.Mutex
+	clients     map[chan string]bool
+	mutex       sync.Mutex
+	lastMessage string // 新增：缓存最后一次消息，供新连接的客户端立即获取
 }
  
 var broker = NewBroker()
@@ -57,6 +58,10 @@ func (b *Broker) AddClient() chan string {
 	ch := make(chan string, 10)
 	b.mutex.Lock()
 	b.clients[ch] = true
+	// 如果有缓存消息，立即发送给新客户端
+	if b.lastMessage != "" {
+		ch <- b.lastMessage
+	}
 	b.mutex.Unlock()
 	return ch
 }
@@ -70,6 +75,7 @@ func (b *Broker) RemoveClient(ch chan string) {
  
 func (b *Broker) Broadcast(msg string) {
 	b.mutex.Lock()
+	b.lastMessage = msg // 缓存最新消息
 	for ch := range b.clients {
 		select {
 		case ch <- msg:
@@ -259,10 +265,15 @@ func (p *parserState) getStyle() string {
 	
 	if p.justification == 1 { style += "text-align:center;" } else if p.justification == 2 { style += "text-align:right;" } else { style += "text-align:left;" }
 	
-	if p.widthMultiple > 1 || p.heightMultiple > 1 {
-		fontSize := 14 * p.widthMultiple
-		lineHeight := 100 * p.heightMultiple
-		style += fmt.Sprintf("font-size:%dpx; line-height:%d%%;", fontSize, lineHeight)
+	// 核心修复：字体大小取宽度和高度的最大值，行距跟随高度倍数
+	scale := 1
+	if p.widthMultiple > p.heightMultiple {
+		scale = p.widthMultiple
+	} else {
+		scale = p.heightMultiple
+	}
+	if scale > 1 {
+		style += fmt.Sprintf("font-size:%dpx; line-height:%d%%;", 14 * scale, 120 * p.heightMultiple)
 	}
 	return style
 }
@@ -275,7 +286,7 @@ func (p *parserState) flushLine() {
 }
  
 func escToHTML(raw []byte) string {
-	// 核心修复：自动检测编码，如果已经是 UTF-8 则直接使用，避免 GBK 解码器破坏控制字符
+	// 自动检测编码，如果是 UTF-8 则直接使用
 	var utf8Data []byte
 	if utf8.Valid(raw) {
 		utf8Data = raw
@@ -316,8 +327,10 @@ func escToHTML(raw []byte) string {
 						n := utf8Data[i+2]
 						p.bold = (n & 8) != 0
 						p.underline = (n & 128) != 0
-						p.heightMultiple = 1; p.widthMultiple = 1
+						// 适配常见的 ESC ! 放大逻辑
+						p.heightMultiple = 1
 						if (n & 16) != 0 { p.heightMultiple = 2 }
+						p.widthMultiple = 1
 						if (n & 32) != 0 { p.widthMultiple = 2 }
 						i += 3; continue
 					}
@@ -367,11 +380,11 @@ func escToHTML(raw []byte) string {
 					}
 				} else {
 					switch cmd {
-					case 33: // GS ! n 英文字体大小
+					case 33: // GS ! n 字体大小
 						if i+2 < len(utf8Data) {
 							n := utf8Data[i+2]
-							p.widthMultiple = int(n>>4)&0x0F + 1
-							p.heightMultiple = int(n)&0x0F + 1
+							p.widthMultiple = int((n>>4)&0x0F) + 1
+							p.heightMultiple = int(n&0x0F) + 1
 							i += 3; continue
 						}
 					case 86: // GS V 切纸
@@ -399,8 +412,11 @@ func escToHTML(raw []byte) string {
 						n := utf8Data[i+2]
 						p.bold = (n & 16) != 0
 						p.underline = (n & 32) != 0
-						p.widthMultiple = int(n&0x03) + 1
-						p.heightMultiple = int((n>>2)&0x03) + 1
+						// 适配常见的 FS ! 放大逻辑
+						p.heightMultiple = 1
+						if (n & 8) != 0 { p.heightMultiple = 2 }
+						p.widthMultiple = 1
+						if (n & 1) != 0 { p.widthMultiple = 2 }
 						i += 3; continue
 					}
 				case 38, 46: // FS & , FS .
