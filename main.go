@@ -97,10 +97,10 @@
 	    <title>ESC/POS 实时小票预览</title>
 	    <style>
 	        html, body { margin: 0; padding: 0; background-color: #f0f0f0; overflow-x: hidden; }
-	        body { font-family: sans-serif; text-align: center; }
-	        .status { color: #888; padding: 1vh 0; font-size: 2vh; position: fixed; top: 0; width: 100%; background: #f0f0f0; z-index: 10; }
+	        body { font-family: sans-serif; text-align: center; padding-bottom: 5vh; }
+	        .status { color: #888; padding: 0.5vh 0; font-size: 2vh; position: fixed; bottom: 0; width: 100%; background: #f0f0f0; z-index: 10; }
 	        .status button { margin-left: 15px; padding: 5px 10px; cursor: pointer; }
-	        #receipt-placeholder { padding-top: 6vh; }
+	        #receipt-placeholder { padding-top: 1vh; }
 	        #receipt-wrapper {
 	            transform-origin: top center;
 	            display: inline-block;
