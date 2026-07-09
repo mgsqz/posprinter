@@ -89,13 +89,13 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
     <title>ESC/POS 实时小票预览</title>
     <style>
         body { background-color: #f0f0f0; font-family: sans-serif; text-align: center; padding: 20px; margin: 0; }
-        .receipt-container { background: #fff; padding: 20px; box-shadow: 0 0 15px rgba(0,0,0,0.1); display: inline-block; min-height: 500px; }
-        .status { color: #888; margin-bottom: 10px; }
+        .receipt-container { background: #fff; padding: 40px; box-shadow: 0 0 15px rgba(0,0,0,0.1); display: inline-block; min-height: 90vh; width: 90%; max-width: 800px; }
+        .status { color: #888; margin-bottom: 10px; font-size: 20px; }
         
         .esc-receipt {
           font-family: 'Courier New', monospace;
-          font-size: 14px;
-          width: 280px; /* 约等于 80mm */
+          font-size: 24px; /* 放大基础字体，使其清晰且填满浏览器 */
+          width: 100%;
           text-align: left;
           display: inline-block;
         }
@@ -231,7 +231,6 @@ func handleConnection(conn net.Conn) {
 						continue
 					}
 				}
-				// 注意：这里不再在TCP层吞掉 ESC p 指令，直接原样存入文件，由解析器安全跳过
 				dataBuf.WriteByte(b)
 				dataBuf.WriteByte(b2)
 				totalBytes += 2
@@ -275,7 +274,7 @@ func handleConnection(conn net.Conn) {
 type parserState struct {
 	sb      strings.Builder
 	lineBuf strings.Builder
-	textBuf []byte // 缓存原始字节，避免指令被错误转码
+	textBuf []byte
  
 	bold          bool
 	underline     bool
@@ -288,7 +287,6 @@ type parserState struct {
  
 func (p *parserState) flushText() {
 	if len(p.textBuf) > 0 {
-		// 核心修复：仅对提取出的纯文本进行编码转换，不影响控制指令的解析
 		var utf8Str string
 		if utf8.Valid(p.textBuf) {
 			utf8Str = string(p.textBuf)
@@ -309,13 +307,24 @@ func (p *parserState) flushText() {
 		if p.underline { style += "text-decoration:underline;" }
 		
 		if p.widthMultiple > 1 || p.heightMultiple > 1 {
-			style += "display: inline-block; vertical-align: top;"
-			if p.heightMultiple > 1 {
+			if p.widthMultiple == p.heightMultiple {
+				// 宽高一致（如宽2高2，宽3高3）：直接用 font-size 等比放大，中文字符真正变胖，完美还原打印机效果
+				style += fmt.Sprintf("font-size: %dpx; line-height: 1; display: inline-block; vertical-align: top;", 24 * p.heightMultiple)
+			} else if p.widthMultiple == 1 {
+				// 宽度正常，高度放大（如宽1高2）：用 font-size 保持宽度，transform scaleY 拉伸高度
+				style += "display: inline-block; vertical-align: top;"
 				marginVal := p.heightMultiple - 1
 				style += fmt.Sprintf("transform: scaleY(%d); transform-origin: top left; margin-bottom: %dem;", p.heightMultiple, marginVal)
-			}
-			if p.widthMultiple > 1 {
-				style += fmt.Sprintf("letter-spacing: %.2fem;", 0.6 * float64(p.widthMultiple - 1))
+			} else {
+				// 其他宽高不等的情况：退回到 letter-spacing 模拟
+				style += "display: inline-block; vertical-align: top;"
+				if p.heightMultiple > 1 {
+					marginVal := p.heightMultiple - 1
+					style += fmt.Sprintf("transform: scaleY(%d); transform-origin: top left; margin-bottom: %dem;", p.heightMultiple, marginVal)
+				}
+				if p.widthMultiple > 1 {
+					style += fmt.Sprintf("letter-spacing: %.2fem;", 1.0 * float64(p.widthMultiple - 1))
+				}
 			}
 			p.lineBuf.WriteString(`<span style="` + style + `">` + text + `</span>`)
 		} else {
@@ -368,7 +377,6 @@ func escToHTML(raw []byte) string {
 				case 69: // ESC E n
 					if i+2 < len(raw) { 
 						n := raw[i+2]
-						// 兼容部分打印机将非0值均视为开启加粗
 						p.bold = (n != 0) 
 						i += 3; continue 
 					}
@@ -377,8 +385,10 @@ func escToHTML(raw []byte) string {
 				case 33: // ESC ! n
 					if i+2 < len(raw) {
 						n := raw[i+2]
-						p.bold = (n & 8) != 0
-						p.underline = (n & 128) != 0
+						if (n & 8) != 0 { p.bold = true } else if n == 0 { p.bold = false }
+						if (n & 128) != 0 { p.underline = true } else if n == 0 { p.underline = false }
+						if n == 0 { p.bold = false }
+						
 						p.heightMultiple = 1
 						if (n & 16) != 0 { p.heightMultiple = 2 }
 						p.widthMultiple = 1
@@ -386,7 +396,6 @@ func escToHTML(raw []byte) string {
 						i += 3; continue
 					}
 				case 112: // ESC p m t1 t2 (钱箱开启脉冲，3个参数)
-					// 核心修复：在这里精确跳过5个字节，防止参数污染文本流
 					if i+4 < len(raw) { i += 5; continue }
 					i += 2; continue
 				case 100: // ESC d n
@@ -439,7 +448,6 @@ func escToHTML(raw []byte) string {
 					case 33: // GS ! n 字体大小
 						if i+2 < len(raw) {
 							n := raw[i+2]
-							// 兼容部分打印机驱动用 0x20 表示重置的非标准行为
 							if n == 0x20 || n == 0x00 {
 								p.widthMultiple = 1
 								p.heightMultiple = 1
@@ -454,7 +462,6 @@ func escToHTML(raw []byte) string {
 						p.sb.WriteString(`<hr style="border-top: 1px dashed #000; margin: 10px 0;">`)
 						if i+2 < len(raw) {
 							m := raw[i+2]
-							// 兼容某些打印机发出的多余参数字节
 							if (m == 0 || m == 1 || m == 48 || m == 49) && i+3 < len(raw) {
 								i += 4; continue
 							}
@@ -480,12 +487,15 @@ func escToHTML(raw []byte) string {
 				case 33: // FS ! n 汉字字体模式
 					if i+2 < len(raw) {
 						n := raw[i+2]
-						p.bold = (n & 16) != 0
-						p.underline = (n & 32) != 0
+						if (n & 16) != 0 { p.bold = true } else if n == 0 { p.bold = false }
+						if (n & 32) != 0 { p.underline = true } else if n == 0 { p.underline = false }
+						if n == 0 { p.bold = false }
+						
 						p.heightMultiple = 1
 						if (n & 8) != 0 { p.heightMultiple = 2 }
 						p.widthMultiple = 1
-						if (n & 1) != 0 { p.widthMultiple = 2 }
+						// 兼容国产小票机非标准指令：bit 2 (0x04) 也作为双宽标志
+						if (n & 1) != 0 || (n & 4) != 0 { p.widthMultiple = 2 }
 						i += 3; continue
 					}
 				case 38, 46: // FS & , FS .
