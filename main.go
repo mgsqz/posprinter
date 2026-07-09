@@ -89,15 +89,17 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
     <title>ESC/POS 实时小票预览</title>
     <style>
         body { background-color: #f0f0f0; font-family: sans-serif; text-align: center; padding: 20px; margin: 0; }
-        .receipt-container { background: #fff; padding: 40px; box-shadow: 0 0 15px rgba(0,0,0,0.1); display: inline-block; min-height: 90vh; width: 90%; max-width: 800px; }
+        /* 去掉 max-width 限制，宽度设为 90%，使其能随浏览器拉宽 */
+        .receipt-container { background: #fff; padding: 40px; box-shadow: 0 0 15px rgba(0,0,0,0.1); display: inline-block; min-height: 90vh; width: 90%; }
         .status { color: #888; margin-bottom: 10px; font-size: 20px; }
         
         .esc-receipt {
           font-family: 'Courier New', monospace;
-          font-size: 24px; /* 放大基础字体，使其清晰且填满浏览器 */
+          font-size: 3vw; /* 核心修复：使用 vw 视口单位，页面拉宽时字体会自动等比放大 */
           width: 100%;
           text-align: left;
           display: inline-block;
+          line-height: 1.2;
         }
     </style>
 </head>
@@ -308,19 +310,17 @@ func (p *parserState) flushText() {
 		
 		if p.widthMultiple > 1 || p.heightMultiple > 1 {
 			if p.widthMultiple == p.heightMultiple {
-				// 宽高一致（如宽2高2，宽3高3）：直接用 font-size 等比放大，中文字符真正变胖，完美还原打印机效果
-				style += fmt.Sprintf("font-size: %dpx; line-height: 1; display: inline-block; vertical-align: top;", 24 * p.heightMultiple)
+				// 宽高一致：使用 em 单位完美继承父级 3vw 的基础字号，实现响应式放大
+				style += fmt.Sprintf("font-size: %dem; display: inline-block; vertical-align: middle;", p.heightMultiple)
 			} else if p.widthMultiple == 1 {
-				// 宽度正常，高度放大（如宽1高2）：用 font-size 保持宽度，transform scaleY 拉伸高度
-				style += "display: inline-block; vertical-align: top;"
+				style += "display: inline-block; vertical-align: middle;"
 				marginVal := p.heightMultiple - 1
-				style += fmt.Sprintf("transform: scaleY(%d); transform-origin: top left; margin-bottom: %dem;", p.heightMultiple, marginVal)
+				style += fmt.Sprintf("transform: scaleY(%d); transform-origin: center; margin-bottom: %dem;", p.heightMultiple, marginVal)
 			} else {
-				// 其他宽高不等的情况：退回到 letter-spacing 模拟
-				style += "display: inline-block; vertical-align: top;"
+				style += "display: inline-block; vertical-align: middle;"
 				if p.heightMultiple > 1 {
 					marginVal := p.heightMultiple - 1
-					style += fmt.Sprintf("transform: scaleY(%d); transform-origin: top left; margin-bottom: %dem;", p.heightMultiple, marginVal)
+					style += fmt.Sprintf("transform: scaleY(%d); transform-origin: center; margin-bottom: %dem;", p.heightMultiple, marginVal)
 				}
 				if p.widthMultiple > 1 {
 					style += fmt.Sprintf("letter-spacing: %.2fem;", 1.0 * float64(p.widthMultiple - 1))
@@ -344,12 +344,14 @@ func (p *parserState) flushLine() {
 	align := "left"
 	if p.justification == 1 { align = "center" } else if p.justification == 2 { align = "right" }
 	
-	divStyle := "white-space: pre-wrap; text-align:" + align + ";"
+	// 核心修复：移除 pre-wrap 防止自动换行，并裁剪行尾的 &nbsp; 空格，防止其干扰居中和居右对齐
+	lineContent := strings.TrimRight(p.lineBuf.String(), "&nbsp;")
+	divStyle := "white-space: nowrap; text-align:" + align + ";"
 	
-	if p.lineBuf.Len() == 0 {
+	if len(lineContent) == 0 {
 		p.sb.WriteString(`<div style="` + divStyle + `">&nbsp;</div>`)
 	} else {
-		p.sb.WriteString(`<div style="` + divStyle + `">` + p.lineBuf.String() + `</div>`)
+		p.sb.WriteString(`<div style="` + divStyle + `">` + lineContent + `</div>`)
 	}
 	p.lineBuf.Reset()
 }
@@ -494,7 +496,6 @@ func escToHTML(raw []byte) string {
 						p.heightMultiple = 1
 						if (n & 8) != 0 { p.heightMultiple = 2 }
 						p.widthMultiple = 1
-						// 兼容国产小票机非标准指令：bit 2 (0x04) 也作为双宽标志
 						if (n & 1) != 0 || (n & 4) != 0 { p.widthMultiple = 2 }
 						i += 3; continue
 					}
