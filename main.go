@@ -88,27 +88,57 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
     <meta charset="UTF-8">
     <title>ESC/POS 实时小票预览</title>
     <style>
-        body { background-color: #f0f0f0; font-family: sans-serif; text-align: center; padding: 20px; margin: 0; }
-        /* 去掉 max-width 限制，宽度设为 90%，使其能随浏览器拉宽 */
-        .receipt-container { background: #fff; padding: 40px; box-shadow: 0 0 15px rgba(0,0,0,0.1); display: inline-block; min-height: 90vh; width: 90%; }
-        .status { color: #888; margin-bottom: 10px; font-size: 20px; }
+        html, body { margin: 0; padding: 0; background-color: #f0f0f0; overflow-x: hidden; }
+        body { font-family: sans-serif; text-align: center; }
+        .status { color: #888; padding: 1vh 0; font-size: 2vh; position: fixed; top: 0; width: 100%; background: #f0f0f0; z-index: 10; }
+        
+        #receipt-placeholder { padding-top: 6vh; } /* 为固定状态栏留出空间 */
+        
+        /* 外层包装，用于应用 scale 变换，实现放大镜效果 */
+        #receipt-wrapper {
+            transform-origin: top center;
+            display: inline-block;
+        }
         
         .esc-receipt {
           font-family: 'Courier New', monospace;
-          font-size: 3vw; /* 核心修复：使用 vw 视口单位，页面拉宽时字体会自动等比放大 */
-          width: 100%;
+          font-size: 12px; /* 固定基础字号，严格还原真实打印比例 */
+          width: 32ch; /* 58mm纸宽约容纳32个半角字符，严格还原实际打印宽度 */
+          padding: 10px 1ch;
+          box-sizing: border-box;
           text-align: left;
-          display: inline-block;
-          line-height: 1.2;
+          display: block;
+          background: #fff;
+          box-shadow: 0 0 15px rgba(0,0,0,0.1);
         }
     </style>
 </head>
 <body>
     <div class="status" id="status">等待打印数据...</div>
-    <div class="receipt-container">
-        <div id="receipt" class="esc-receipt"></div>
+    <div id="receipt-placeholder">
+        <div id="receipt-wrapper">
+            <div id="receipt" class="esc-receipt"></div>
+        </div>
     </div>
     <script>
+        // 核心修复：动态计算缩放比例，实现随浏览器宽度等比缩放的放大镜效果
+        function adjustScale() {
+            const receipt = document.getElementById('receipt');
+            const wrapper = document.getElementById('receipt-wrapper');
+            if (!receipt || receipt.offsetWidth === 0) return;
+            
+            const actualWidth = receipt.offsetWidth;
+            const windowWidth = window.innerWidth;
+            const scale = (windowWidth * 0.9) / actualWidth;
+            
+            wrapper.style.transform = `scale(${scale})`;
+            
+            // 修正缩放后父容器的高度，防止下方留白或滚动异常
+            const actualHeight = receipt.offsetHeight;
+            const placeholder = document.getElementById('receipt-placeholder');
+            placeholder.style.height = (actualHeight * scale) + 'px';
+        }
+        
         async function fetchReceipt() {
             try {
                 const response = await fetch('/data?ts=' + new Date().getTime());
@@ -116,9 +146,11 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
                     const html = await response.text();
                     document.getElementById('receipt').innerHTML = html;
                     document.getElementById('status').innerText = "最后刷新: " + new Date().toLocaleTimeString();
+                    adjustScale();
                 }
             } catch (e) {}
         }
+        window.addEventListener('resize', adjustScale);
         setInterval(fetchReceipt, 1000); // 每秒执行一次
         fetchReceipt(); // 首次立即执行
     </script>
@@ -283,6 +315,8 @@ type parserState struct {
 	widthMultiple int
 	heightMultiple int
 	justification int
+	
+	maxHeightMultiple int // 记录当前行最大高度倍数，用于撑开行高防止重叠
  
 	qrData []byte
 }
@@ -309,18 +343,16 @@ func (p *parserState) flushText() {
 		if p.underline { style += "text-decoration:underline;" }
 		
 		if p.widthMultiple > 1 || p.heightMultiple > 1 {
+			if p.heightMultiple > p.maxHeightMultiple {
+				p.maxHeightMultiple = p.heightMultiple
+			}
+			
+			style += "display: inline-block; vertical-align: middle; line-height: 1;"
 			if p.widthMultiple == p.heightMultiple {
-				// 宽高一致：使用 em 单位完美继承父级 3vw 的基础字号，实现响应式放大
-				style += fmt.Sprintf("font-size: %dem; display: inline-block; vertical-align: middle;", p.heightMultiple)
-			} else if p.widthMultiple == 1 {
-				style += "display: inline-block; vertical-align: middle;"
-				marginVal := p.heightMultiple - 1
-				style += fmt.Sprintf("transform: scaleY(%d); transform-origin: center; margin-bottom: %dem;", p.heightMultiple, marginVal)
+				style += fmt.Sprintf("font-size: %dem;", p.heightMultiple)
 			} else {
-				style += "display: inline-block; vertical-align: middle;"
 				if p.heightMultiple > 1 {
-					marginVal := p.heightMultiple - 1
-					style += fmt.Sprintf("transform: scaleY(%d); transform-origin: center; margin-bottom: %dem;", p.heightMultiple, marginVal)
+					style += fmt.Sprintf("transform: scaleY(%d);", p.heightMultiple)
 				}
 				if p.widthMultiple > 1 {
 					style += fmt.Sprintf("letter-spacing: %.2fem;", 1.0 * float64(p.widthMultiple - 1))
@@ -344,22 +376,24 @@ func (p *parserState) flushLine() {
 	align := "left"
 	if p.justification == 1 { align = "center" } else if p.justification == 2 { align = "right" }
 	
-	// 核心修复：移除 pre-wrap 防止自动换行，并裁剪行尾的 &nbsp; 空格，防止其干扰居中和居右对齐
 	lineContent := strings.TrimRight(p.lineBuf.String(), "&nbsp;")
-	divStyle := "white-space: nowrap; text-align:" + align + ";"
+	// 核心修复：动态行高，确保高度被拉伸的字体不会与上下行重叠
+	divStyle := fmt.Sprintf("white-space: nowrap; text-align:%s; line-height: %fem;", align, 1.2 * float64(p.maxHeightMultiple))
 	
 	if len(lineContent) == 0 {
-		p.sb.WriteString(`<div style="` + divStyle + `">&nbsp;</div>`)
+		p.sb.WriteString(fmt.Sprintf(`<div style="%s">&nbsp;</div>`, divStyle))
 	} else {
-		p.sb.WriteString(`<div style="` + divStyle + `">` + lineContent + `</div>`)
+		p.sb.WriteString(fmt.Sprintf(`<div style="%s">%s</div>`, divStyle, lineContent))
 	}
 	p.lineBuf.Reset()
+	p.maxHeightMultiple = 1 // 重置行高倍数
 }
  
 func escToHTML(raw []byte) string {
 	p := &parserState{
-		widthMultiple:  1,
-		heightMultiple: 1,
+		widthMultiple:     1,
+		heightMultiple:    1,
+		maxHeightMultiple: 1,
 	}
  
 	i := 0
